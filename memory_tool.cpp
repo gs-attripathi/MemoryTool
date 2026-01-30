@@ -356,10 +356,44 @@ public:
         
         int successCount = 0;
         for (size_t idx : indices) {
+            DWORD_PTR address = searchResults[idx].address;
+            SIZE_T size = newBytes.size();
+            
+            // Try to change memory protection to allow writing
+            DWORD oldProtect;
+            bool protectionChanged = VirtualProtectEx(processHandle, (LPVOID)address, 
+                                                    size, PAGE_EXECUTE_READWRITE, &oldProtect);
+            
             SIZE_T bytesWritten;
-            if (WriteProcessMemory(processHandle, (LPVOID)searchResults[idx].address,
-                                 newBytes.data(), newBytes.size(), &bytesWritten)) {
+            if (WriteProcessMemory(processHandle, (LPVOID)address,
+                                 newBytes.data(), size, &bytesWritten)) {
                 successCount++;
+            } else {
+                DWORD error = GetLastError();
+                if (idx < 5) { // Only show first 5 errors to avoid spam
+                    std::cout << "Failed to write to address 0x" << std::hex 
+                             << address << std::dec 
+                             << " - Error: " << error;
+                    switch (error) {
+                        case ERROR_ACCESS_DENIED:
+                            std::cout << " (Access Denied - Try running as Administrator)";
+                            break;
+                        case ERROR_INVALID_HANDLE:
+                            std::cout << " (Invalid Process Handle)";
+                            break;
+                        case ERROR_PARTIAL_COPY:
+                            std::cout << " (Memory Protection - Read-only region)";
+                            break;
+                        default:
+                            std::cout << " (Unknown error)";
+                    }
+                    std::cout << std::endl;
+                }
+            }
+            
+            // Restore original protection
+            if (protectionChanged) {
+                VirtualProtectEx(processHandle, (LPVOID)address, size, oldProtect, &oldProtect);
             }
         }
         
@@ -638,7 +672,8 @@ public:
     // Main menu loop
     void Run() {
         std::cout << "=== Memory Tool v1.0 ===\n";
-        std::cout << "A Cheat Engine-like memory manipulation tool\n\n";
+        std::cout << "A Cheat Engine-like memory manipulation tool\n";
+        std::cout << "WARNING: For memory modification to work, run as Administrator!\n\n";
         
         std::string processSubstring;
         std::cout << "Enter process name substring (e.g., 'forza' for ForzaHorizon5.exe): ";

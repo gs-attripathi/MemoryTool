@@ -285,7 +285,7 @@ public:
             }
         }
     }
- 
+
     // Get size for data type
     size_t GetTypeSize(DataType type) {
         switch (type) {
@@ -381,8 +381,8 @@ public:
                     }
                 } else {
                     // Exact matching for other types
-                    for (SIZE_T i = 0; i <= bytesRead - searchBytes.size(); i++) {
-                        if (memcmp(buffer.data() + i, searchBytes.data(), searchBytes.size()) == 0) {
+                for (SIZE_T i = 0; i <= bytesRead - searchBytes.size(); i++) {
+                    if (memcmp(buffer.data() + i, searchBytes.data(), searchBytes.size()) == 0) {
                             DWORD_PTR foundAddr = baseAddr + offset + i;
                             
                             // Validate that this address is in writable memory
@@ -392,12 +392,12 @@ public:
                                 if (mbi.State == MEM_COMMIT && 
                                     (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY))) {
                                     
-                                    MemoryResult result;
+                        MemoryResult result;
                                     result.address = foundAddr;
-                                    result.value = searchBytes;
-                                    result.type = type;
-                                    result.size = searchBytes.size();
-                                    searchResults.push_back(result);
+                        result.value = searchBytes;
+                        result.type = type;
+                        result.size = searchBytes.size();
+                        searchResults.push_back(result);
                                 }
                             }
                         }
@@ -589,6 +589,352 @@ public:
         return indices;
     }
 
+    // Filter current search results
+    void FilterResults() {
+        if (searchResults.empty()) {
+            std::cout << "No search results to filter. Perform a search first.\n";
+            return;
+        }
+
+        std::cout << "Current results: " << searchResults.size() << " addresses\n";
+        std::cout << "\n=== Filter Options ===\n";
+        std::cout << "1. Filter by current value (re-read memory)\n";
+        std::cout << "2. Filter by value range\n";
+        std::cout << "3. Filter by address range\n";
+        std::cout << "4. Filter by changed values\n";
+        std::cout << "5. Filter by unchanged values\n";
+        std::cout << "6. Filter by increased values\n";
+        std::cout << "7. Filter by decreased values\n";
+        std::cout << "Choice: ";
+
+        int filterChoice;
+        std::cin >> filterChoice;
+
+        switch (filterChoice) {
+            case 1:
+                FilterByCurrentValue();
+                break;
+            case 2:
+                FilterByValueRange();
+                break;
+            case 3:
+                FilterByAddressRange();
+                break;
+            case 4:
+                FilterByChanged();
+                break;
+            case 5:
+                FilterByUnchanged();
+                break;
+            case 6:
+                FilterByIncreased();
+                break;
+            case 7:
+                FilterByDecreased();
+                break;
+            default:
+                std::cout << "Invalid choice.\n";
+                return;
+        }
+
+        std::cout << "Filter complete. Results: " << searchResults.size() << " addresses\n";
+        DisplayResults();
+    }
+
+    // Filter by current value in memory
+    void FilterByCurrentValue() {
+        std::cout << "Enter value to filter by: ";
+        std::string value;
+        std::cin.ignore();
+        std::getline(std::cin, value);
+
+        if (searchResults.empty()) return;
+
+        DataType type = searchResults[0].type;
+        std::vector<BYTE> filterBytes = StringToBytes(value, type);
+        
+        std::vector<MemoryResult> filteredResults;
+        
+        for (auto& result : searchResults) {
+            // Read current value from memory
+            std::vector<BYTE> currentValue(result.size);
+            SIZE_T bytesRead;
+            
+            if (ReadProcessMemory(processHandle, (LPCVOID)result.address,
+                                currentValue.data(), result.size, &bytesRead)) {
+                
+                bool matches = false;
+                
+                if (type == TYPE_FLOAT) {
+                    float currentFloat = *(float*)currentValue.data();
+                    float searchFloat = *(float*)filterBytes.data();
+                    matches = IsFloatFuzzyMatch(searchFloat, currentFloat);
+                } else if (type == TYPE_DOUBLE) {
+                    double currentDouble = *(double*)currentValue.data();
+                    double searchDouble = *(double*)filterBytes.data();
+                    matches = IsDoubleFuzzyMatch(searchDouble, currentDouble);
+                } else {
+                    matches = (memcmp(currentValue.data(), filterBytes.data(), result.size) == 0);
+                }
+                
+                if (matches) {
+                    result.value = currentValue; // Update stored value
+                    filteredResults.push_back(result);
+                }
+            }
+        }
+        
+        searchResults = filteredResults;
+    }
+
+    // Filter by value range
+    void FilterByValueRange() {
+        if (searchResults.empty()) return;
+        
+        DataType type = searchResults[0].type;
+        
+        if (type == TYPE_STRING) {
+            std::cout << "Range filtering not supported for strings.\n";
+            return;
+        }
+
+        std::cout << "Enter minimum value: ";
+        std::string minStr;
+        std::cin >> minStr;
+        
+        std::cout << "Enter maximum value: ";
+        std::string maxStr;
+        std::cin >> maxStr;
+
+        std::vector<MemoryResult> filteredResults;
+        
+        for (auto& result : searchResults) {
+            // Read current value from memory
+            std::vector<BYTE> currentValue(result.size);
+            SIZE_T bytesRead;
+            
+            if (ReadProcessMemory(processHandle, (LPCVOID)result.address,
+                                currentValue.data(), result.size, &bytesRead)) {
+                
+                bool inRange = false;
+                
+                switch (type) {
+                    case TYPE_BYTE: {
+                        BYTE val = *(BYTE*)currentValue.data();
+                        BYTE minVal = (BYTE)std::stoi(minStr);
+                        BYTE maxVal = (BYTE)std::stoi(maxStr);
+                        inRange = (val >= minVal && val <= maxVal);
+                        break;
+                    }
+                    case TYPE_2BYTE: {
+                        WORD val = *(WORD*)currentValue.data();
+                        WORD minVal = (WORD)std::stoi(minStr);
+                        WORD maxVal = (WORD)std::stoi(maxStr);
+                        inRange = (val >= minVal && val <= maxVal);
+                        break;
+                    }
+                    case TYPE_4BYTE: {
+                        DWORD val = *(DWORD*)currentValue.data();
+                        DWORD minVal = (DWORD)std::stoul(minStr);
+                        DWORD maxVal = (DWORD)std::stoul(maxStr);
+                        inRange = (val >= minVal && val <= maxVal);
+                        break;
+                    }
+                    case TYPE_FLOAT: {
+                        float val = *(float*)currentValue.data();
+                        float minVal = std::stof(minStr);
+                        float maxVal = std::stof(maxStr);
+                        inRange = (val >= minVal && val <= maxVal);
+                        break;
+                    }
+                    case TYPE_DOUBLE: {
+                        double val = *(double*)currentValue.data();
+                        double minVal = std::stod(minStr);
+                        double maxVal = std::stod(maxStr);
+                        inRange = (val >= minVal && val <= maxVal);
+                        break;
+                    }
+                }
+                
+                if (inRange) {
+                    result.value = currentValue; // Update stored value
+                    filteredResults.push_back(result);
+                }
+            }
+        }
+        
+        searchResults = filteredResults;
+    }
+
+    // Filter by address range
+    void FilterByAddressRange() {
+        std::cout << "Enter minimum address (hex, e.g., 0x400000): ";
+        std::string minStr;
+        std::cin >> minStr;
+        
+        std::cout << "Enter maximum address (hex, e.g., 0x500000): ";
+        std::string maxStr;
+        std::cin >> maxStr;
+
+        DWORD_PTR minAddr = std::stoull(minStr, nullptr, 16);
+        DWORD_PTR maxAddr = std::stoull(maxStr, nullptr, 16);
+
+        std::vector<MemoryResult> filteredResults;
+        
+        for (const auto& result : searchResults) {
+            if (result.address >= minAddr && result.address <= maxAddr) {
+                filteredResults.push_back(result);
+            }
+        }
+        
+        searchResults = filteredResults;
+    }
+
+    // Filter by changed values
+    void FilterByChanged() {
+        std::vector<MemoryResult> filteredResults;
+        
+        for (auto& result : searchResults) {
+            // Read current value from memory
+            std::vector<BYTE> currentValue(result.size);
+            SIZE_T bytesRead;
+            
+            if (ReadProcessMemory(processHandle, (LPCVOID)result.address,
+                                currentValue.data(), result.size, &bytesRead)) {
+                
+                // Compare with stored value
+                if (memcmp(currentValue.data(), result.value.data(), result.size) != 0) {
+                    result.value = currentValue; // Update stored value
+                    filteredResults.push_back(result);
+                }
+            }
+        }
+        
+        searchResults = filteredResults;
+    }
+
+    // Filter by unchanged values
+    void FilterByUnchanged() {
+        std::vector<MemoryResult> filteredResults;
+        
+        for (const auto& result : searchResults) {
+            // Read current value from memory
+            std::vector<BYTE> currentValue(result.size);
+            SIZE_T bytesRead;
+            
+            if (ReadProcessMemory(processHandle, (LPCVOID)result.address,
+                                currentValue.data(), result.size, &bytesRead)) {
+                
+                // Compare with stored value
+                if (memcmp(currentValue.data(), result.value.data(), result.size) == 0) {
+                    filteredResults.push_back(result);
+                }
+            }
+        }
+        
+        searchResults = filteredResults;
+    }
+
+    // Filter by increased values
+    void FilterByIncreased() {
+        if (searchResults.empty()) return;
+        
+        DataType type = searchResults[0].type;
+        if (type == TYPE_STRING) {
+            std::cout << "Increase/decrease filtering not supported for strings.\n";
+            return;
+        }
+
+        std::vector<MemoryResult> filteredResults;
+        
+        for (auto& result : searchResults) {
+            // Read current value from memory
+            std::vector<BYTE> currentValue(result.size);
+            SIZE_T bytesRead;
+            
+            if (ReadProcessMemory(processHandle, (LPCVOID)result.address,
+                                currentValue.data(), result.size, &bytesRead)) {
+                
+                bool increased = false;
+                
+                switch (type) {
+                    case TYPE_BYTE:
+                        increased = *(BYTE*)currentValue.data() > *(BYTE*)result.value.data();
+                        break;
+                    case TYPE_2BYTE:
+                        increased = *(WORD*)currentValue.data() > *(WORD*)result.value.data();
+                        break;
+                    case TYPE_4BYTE:
+                        increased = *(DWORD*)currentValue.data() > *(DWORD*)result.value.data();
+                        break;
+                    case TYPE_FLOAT:
+                        increased = *(float*)currentValue.data() > *(float*)result.value.data();
+                        break;
+                    case TYPE_DOUBLE:
+                        increased = *(double*)currentValue.data() > *(double*)result.value.data();
+                        break;
+                }
+                
+                if (increased) {
+                    result.value = currentValue; // Update stored value
+                    filteredResults.push_back(result);
+                }
+            }
+        }
+        
+        searchResults = filteredResults;
+    }
+
+    // Filter by decreased values
+    void FilterByDecreased() {
+        if (searchResults.empty()) return;
+        
+        DataType type = searchResults[0].type;
+        if (type == TYPE_STRING) {
+            std::cout << "Increase/decrease filtering not supported for strings.\n";
+            return;
+        }
+
+        std::vector<MemoryResult> filteredResults;
+        
+        for (auto& result : searchResults) {
+            // Read current value from memory
+            std::vector<BYTE> currentValue(result.size);
+            SIZE_T bytesRead;
+            
+            if (ReadProcessMemory(processHandle, (LPCVOID)result.address,
+                                currentValue.data(), result.size, &bytesRead)) {
+                
+                bool decreased = false;
+                
+                switch (type) {
+                    case TYPE_BYTE:
+                        decreased = *(BYTE*)currentValue.data() < *(BYTE*)result.value.data();
+                        break;
+                    case TYPE_2BYTE:
+                        decreased = *(WORD*)currentValue.data() < *(WORD*)result.value.data();
+                        break;
+                    case TYPE_4BYTE:
+                        decreased = *(DWORD*)currentValue.data() < *(DWORD*)result.value.data();
+                        break;
+                    case TYPE_FLOAT:
+                        decreased = *(float*)currentValue.data() < *(float*)result.value.data();
+                        break;
+                    case TYPE_DOUBLE:
+                        decreased = *(double*)currentValue.data() < *(double*)result.value.data();
+                        break;
+                }
+                
+                if (decreased) {
+                    result.value = currentValue; // Update stored value
+                    filteredResults.push_back(result);
+                }
+            }
+        }
+        
+        searchResults = filteredResults;
+    }
+
     // Search for pointers to a specific address
     void SearchPointers() {
         std::cout << "Enter target address (hex, e.g., 0x12345678): ";
@@ -615,7 +961,7 @@ public:
         
         // Perform pointer search (simplified without threading for compatibility)
         std::cout << "Press Ctrl+C to interrupt search if needed...\n";
-        PerformPointerSearch(targetAddr, maxOffset, maxDepth);
+            PerformPointerSearch(targetAddr, maxOffset, maxDepth);
         
         std::cout << "Pointer search complete. Found " << pointerResults.size() << " pointer paths.\n";
         DisplayPointerResults();
@@ -668,7 +1014,7 @@ public:
                 (mbi.Protect & PAGE_NOACCESS) == 0) {
                 
                 FindPointersInRegionSimple((DWORD_PTR)mbi.BaseAddress, mbi.RegionSize, 
-                                         targetAddr, pointers);
+                                   targetAddr, pointers);
             }
             
             address = (DWORD_PTR)mbi.BaseAddress + mbi.RegionSize;
@@ -730,15 +1076,15 @@ public:
             if (ReadProcessMemory(processHandle, (LPCVOID)checkAddr, 
                                 &value, sizeof(value), &bytesRead)) {
                 
-                // Check if this points directly to target
-                if (value == targetAddr) {
-                    PointerPath path;
-                    path.baseName = baseName;
-                    path.baseAddress = baseAddr;
-                    path.offsets.push_back(offset);
-                    path.finalAddress = targetAddr;
-                    path.depth = 1;
-                    pointerResults.push_back(path);
+                    // Check if this points directly to target
+                    if (value == targetAddr) {
+                        PointerPath path;
+                        path.baseName = baseName;
+                        path.baseAddress = baseAddr;
+                        path.offsets.push_back(offset);
+                        path.finalAddress = targetAddr;
+                        path.depth = 1;
+                        pointerResults.push_back(path);
                     pathsFound++;
                     
                     std::cout << "Found Level 1 pointer: " << baseName << "+0x" 
@@ -883,8 +1229,9 @@ public:
             std::cout << "\n=== Main Menu ===\n";
             std::cout << "1. Search for value in memory\n";
             std::cout << "2. Modify found values\n";
-            std::cout << "3. Search for pointers to address\n";
-            std::cout << "4. Exit\n";
+            std::cout << "3. Filter current results\n";
+            std::cout << "4. Search for pointers to address\n";
+            std::cout << "5. Exit\n";
             std::cout << "Choice: ";
             
             int choice;
@@ -898,9 +1245,12 @@ public:
                     ModifyValues();
                     break;
                 case 3:
-                    SearchPointers();
+                    FilterResults();
                     break;
                 case 4:
+                    SearchPointers();
+                    break;
+                case 5:
                     std::cout << "Goodbye!\n";
                     return;
                 default:

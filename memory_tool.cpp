@@ -601,8 +601,7 @@ public:
     // Save pointer results to file
     void SavePointerResults() {
         std::string filename = "pointer_scan_" + processName + "_" + 
-                              std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
-                                  std::chrono::system_clock::now().time_since_epoch()).count()) + ".txt";
+                              std::to_string(GetTickCount()) + ".txt";
         
         std::ofstream file(filename);
         if (!file.is_open()) {

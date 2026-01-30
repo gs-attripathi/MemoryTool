@@ -12,6 +12,10 @@
 #include <set>
 #include <conio.h>
 #include <cmath>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <future>
 
 #pragma comment(lib, "psapi.lib")
 
@@ -57,9 +61,15 @@ private:
     std::string currentScanType;
     int currentProgress;
     int totalProgress;
+    
+    // Thread-safe pointer map building
+    std::mutex pointerMapMutex;
+    std::atomic<int> regionsProcessed;
+    std::atomic<int> totalPointersFound;
 
 public:
-    MemoryTool() : processHandle(NULL), processId(0), interruptSearch(false) {}
+    MemoryTool() : processHandle(NULL), processId(0), interruptSearch(false), 
+                   regionsProcessed(0), totalPointersFound(0) {}
     
     ~MemoryTool() {
         if (processHandle) {
@@ -1091,54 +1101,115 @@ public:
         FinishProgress("Found " + std::to_string(pointerResults.size()) + " pointer paths");
     }
 
-    // Build comprehensive pointer map of entire process memory
+    // Fast parallelized pointer map building (Cheat Engine style)
     void BuildPointerMap(std::map<DWORD_PTR, std::vector<DWORD_PTR>>& pointerMap) {
-        // First pass: count total regions
-        MEMORY_BASIC_INFORMATION mbi;
-        DWORD_PTR address = 0;
-        int totalRegions = 0;
+        // Collect all scannable memory regions first
+        std::vector<std::pair<DWORD_PTR, SIZE_T>> regions;
+        CollectScannableRegions(regions);
         
-        while (VirtualQueryEx(processHandle, (LPCVOID)address, &mbi, sizeof(mbi))) {
-            if (mbi.State == MEM_COMMIT && 
-                (mbi.Protect & PAGE_GUARD) == 0 && 
-                (mbi.Protect & PAGE_NOACCESS) == 0 &&
-                (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
-                totalRegions++;
-            }
-            address = (DWORD_PTR)mbi.BaseAddress + mbi.RegionSize;
+        if (regions.empty()) {
+            std::cout << "No scannable memory regions found!\n";
+            return;
         }
         
-        // Second pass: build pointer map with progress
-        StartProgress("POINTER MAP:", totalRegions);
+        std::cout << "Found " << regions.size() << " scannable regions. Building pointer map...\n";
+        StartProgress("POINTER MAP:", regions.size());
         
-        address = 0;
-        int regionsScanned = 0;
-        int totalPointers = 0;
+        // Reset atomic counters
+        regionsProcessed = 0;
+        totalPointersFound = 0;
         
-        while (VirtualQueryEx(processHandle, (LPCVOID)address, &mbi, sizeof(mbi)) && !interruptSearch) {
-            // Only scan committed, readable memory
-            if (mbi.State == MEM_COMMIT && 
-                (mbi.Protect & PAGE_GUARD) == 0 && 
-                (mbi.Protect & PAGE_NOACCESS) == 0 &&
-                (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
-                
-                regionsScanned++;
-                int regionPointers = ScanRegionForPointers((DWORD_PTR)mbi.BaseAddress, 
-                                                         mbi.RegionSize, pointerMap);
-                totalPointers += regionPointers;
-                UpdateProgress(regionsScanned);
+        // Determine optimal thread count (don't exceed CPU cores)
+        unsigned int threadCount = std::min(std::thread::hardware_concurrency(), 8u);
+        if (threadCount == 0) threadCount = 4; // Fallback
+        
+        std::cout << "Using " << threadCount << " threads for scanning.\n";
+        
+        // Divide regions among threads
+        std::vector<std::future<void>> futures;
+        size_t regionsPerThread = regions.size() / threadCount;
+        
+        for (unsigned int i = 0; i < threadCount; i++) {
+            size_t startIdx = i * regionsPerThread;
+            size_t endIdx = (i == threadCount - 1) ? regions.size() : (i + 1) * regionsPerThread;
+            
+            futures.push_back(std::async(std::launch::async, [this, &pointerMap, &regions, startIdx, endIdx]() {
+                ScanRegionsThreaded(pointerMap, regions, startIdx, endIdx);
+            }));
+        }
+        
+        // Monitor progress while threads work
+        while (regionsProcessed < (int)regions.size() && !interruptSearch) {
+            UpdateProgress(regionsProcessed);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        
+        // Wait for all threads to complete
+        for (auto& future : futures) {
+            future.wait();
+        }
+        
+        FinishProgress("Found " + std::to_string(totalPointersFound.load()) + " pointers");
+    }
+    
+    // Collect all memory regions suitable for pointer scanning
+    void CollectScannableRegions(std::vector<std::pair<DWORD_PTR, SIZE_T>>& regions) {
+        MEMORY_BASIC_INFORMATION mbi;
+        DWORD_PTR address = 0;
+        
+        while (VirtualQueryEx(processHandle, (LPCVOID)address, &mbi, sizeof(mbi))) {
+            // Cheat Engine optimization: Only scan specific memory types
+            bool isScannable = (mbi.State == MEM_COMMIT && 
+                               (mbi.Protect & PAGE_GUARD) == 0 && 
+                               (mbi.Protect & PAGE_NOACCESS) == 0);
+            
+            // Focus on likely pointer-containing regions
+            bool isPointerRegion = (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) ||
+                                  (mbi.Type == MEM_PRIVATE) || // Heap allocations
+                                  (mbi.Type == MEM_IMAGE);     // Module sections
+            
+            // Skip very small regions (likely not useful)
+            bool isReasonableSize = mbi.RegionSize >= 4096; // At least 4KB
+            
+            if (isScannable && isPointerRegion && isReasonableSize) {
+                regions.push_back({(DWORD_PTR)mbi.BaseAddress, mbi.RegionSize});
             }
             
             address = (DWORD_PTR)mbi.BaseAddress + mbi.RegionSize;
         }
+    }
+    
+    // Thread worker function for scanning regions
+    void ScanRegionsThreaded(std::map<DWORD_PTR, std::vector<DWORD_PTR>>& pointerMap,
+                           const std::vector<std::pair<DWORD_PTR, SIZE_T>>& regions,
+                           size_t startIdx, size_t endIdx) {
         
-        FinishProgress("Found " + std::to_string(totalPointers) + " pointers");
+        // Each thread builds its own local map to avoid contention
+        std::map<DWORD_PTR, std::vector<DWORD_PTR>> localMap;
+        
+        for (size_t i = startIdx; i < endIdx && !interruptSearch; i++) {
+            DWORD_PTR baseAddr = regions[i].first;
+            SIZE_T size = regions[i].second;
+            
+            int regionPointers = ScanRegionForPointersOptimized(baseAddr, size, localMap);
+            totalPointersFound += regionPointers;
+            regionsProcessed++;
+        }
+        
+        // Merge local map into global map (thread-safe)
+        if (!localMap.empty()) {
+            std::lock_guard<std::mutex> lock(pointerMapMutex);
+            for (const auto& entry : localMap) {
+                auto& globalList = pointerMap[entry.first];
+                globalList.insert(globalList.end(), entry.second.begin(), entry.second.end());
+            }
+        }
     }
 
-    // Scan memory region for all pointers (Cheat Engine approach)
-    int ScanRegionForPointers(DWORD_PTR baseAddr, SIZE_T size, 
-                             std::map<DWORD_PTR, std::vector<DWORD_PTR>>& pointerMap) {
-        const SIZE_T CHUNK_SIZE = 1024 * 1024; // 1MB chunks
+    // Optimized region scanning for pointers (Cheat Engine optimizations)
+    int ScanRegionForPointersOptimized(DWORD_PTR baseAddr, SIZE_T size, 
+                                      std::map<DWORD_PTR, std::vector<DWORD_PTR>>& pointerMap) {
+        const SIZE_T CHUNK_SIZE = 2 * 1024 * 1024; // 2MB chunks for better performance
         std::vector<BYTE> buffer(CHUNK_SIZE);
         int pointersFound = 0;
         
@@ -1149,27 +1220,76 @@ public:
             if (ReadProcessMemory(processHandle, (LPCVOID)(baseAddr + offset), 
                                 buffer.data(), readSize, &bytesRead)) {
                 
-                // Scan every pointer-sized value in this chunk
-                for (SIZE_T i = 0; i <= bytesRead - sizeof(DWORD_PTR); i += sizeof(DWORD_PTR)) {
-                    DWORD_PTR pointerValue = *(DWORD_PTR*)(buffer.data() + i);
-                    DWORD_PTR pointerAddress = baseAddr + offset + i;
-                    
-                    // Filter out obviously invalid pointers
-                    if (IsValidPointer(pointerValue)) {
-                        // Add this pointer to our map
-                        pointerMap[pointerValue].push_back(pointerAddress);
-                        pointersFound++;
-                        
-                        // Prevent memory explosion
-                        if (pointersFound > 1000000) { // 1M pointers max per region
-                            return pointersFound;
-                        }
-                    }
+                // Cheat Engine optimization: Skip obviously non-pointer regions
+                if (IsLikelyPointerRegion(buffer.data(), bytesRead)) {
+                    pointersFound += ScanChunkForPointers(buffer.data(), bytesRead, 
+                                                        baseAddr + offset, pointerMap);
+                }
+                
+                // Prevent memory explosion per thread
+                if (pointersFound > 500000) { // 500K pointers max per region per thread
+                    break;
                 }
             }
         }
         
         return pointersFound;
+    }
+    
+    // Check if a memory chunk is likely to contain pointers
+    bool IsLikelyPointerRegion(const BYTE* data, SIZE_T size) {
+        if (size < 64) return false;
+        
+        int validPointerCount = 0;
+        int totalChecked = 0;
+        
+        // Sample every 64 bytes to check if region contains pointer-like values
+        for (SIZE_T i = 0; i < size - sizeof(DWORD_PTR); i += 64) {
+            DWORD_PTR value = *(DWORD_PTR*)(data + i);
+            totalChecked++;
+            
+            // Quick pointer validation (without expensive memory checks)
+            if (value > 0x10000 && value < 0x7FFFFFFFFFFF && (value & 0x3) == 0) {
+                validPointerCount++;
+            }
+            
+            if (totalChecked >= 16) break; // Sample enough
+        }
+        
+        // If more than 10% of sampled values look like pointers, scan this region
+        return (validPointerCount * 10 > totalChecked);
+    }
+    
+    // Scan a memory chunk for pointers with optimizations
+    int ScanChunkForPointers(const BYTE* data, SIZE_T size, DWORD_PTR baseAddr,
+                           std::map<DWORD_PTR, std::vector<DWORD_PTR>>& pointerMap) {
+        int pointersFound = 0;
+        
+        // Cheat Engine optimization: Use SIMD-friendly loop
+        for (SIZE_T i = 0; i <= size - sizeof(DWORD_PTR); i += sizeof(DWORD_PTR)) {
+            DWORD_PTR pointerValue = *(DWORD_PTR*)(data + i);
+            
+            // Fast pointer validation (most important optimization)
+            if (IsValidPointerFast(pointerValue)) {
+                DWORD_PTR pointerAddress = baseAddr + i;
+                pointerMap[pointerValue].push_back(pointerAddress);
+                pointersFound++;
+            }
+        }
+        
+        return pointersFound;
+    }
+    
+    // Fast pointer validation without expensive system calls
+    bool IsValidPointerFast(DWORD_PTR value) {
+        // Basic range checks (very fast)
+        if (value < 0x10000) return false;           // Too low
+        if (value > 0x7FFFFFFFFFFF) return false;    // Too high for user space
+        if ((value & 0x3) != 0) return false;       // Not aligned to 4 bytes
+        
+        // Cheat Engine optimization: Skip expensive VirtualQueryEx for speed
+        // We'll validate these during pointer chain building instead
+        return true;
     }
     
     // Check if a value looks like a valid pointer

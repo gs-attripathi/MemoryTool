@@ -54,8 +54,20 @@ struct ThreadData {
     size_t endIdx;
 };
 
-// Forward declaration for thread procedure
+// Structure scan thread data
+struct StructureScanData {
+    DWORD_PTR targetAddr;
+    const std::map<DWORD_PTR, std::vector<DWORD_PTR>>* pointerMap;
+    std::vector<std::pair<DWORD_PTR, int>>* results;
+    int startOffset;
+    int endOffset;
+    class MemoryTool* memoryTool;
+    volatile LONG processed;
+};
+
+// Forward declarations for thread procedures
 DWORD WINAPI ScanRegionsThreadProc(LPVOID lpParam);
+DWORD WINAPI StructureScanThreadProc(LPVOID lpParam);
 
 class MemoryTool {
 private:
@@ -65,7 +77,6 @@ private:
     std::vector<MemoryResult> searchResults;
     std::vector<PointerPath> pointerResults;
     std::map<std::string, DWORD_PTR> moduleMap;
-    bool interruptSearch;
     
     // Progress tracking for in-place logging
     std::string currentScanType;
@@ -80,6 +91,9 @@ private:
     bool criticalSectionInitialized;
 
 public:
+    // Public accessor for thread safety
+    volatile bool interruptSearch;
+
     MemoryTool() : processHandle(NULL), processId(0), interruptSearch(false), 
                    regionsProcessed(0), totalPointersFound(0), criticalSectionInitialized(false) {
         InitializeCriticalSection(&pointerMapCriticalSection);
@@ -1129,7 +1143,7 @@ public:
             // Automatically search nearby addresses (Cheat Engine behavior)
             std::cout << "\nAutomatically searching nearby addresses for structure-based pointers...\n";
             std::vector<std::pair<DWORD_PTR, int>> nearbyWithPointers;
-            FindNearbyAddressesWithPointers(targetAddr, pointerMap, nearbyWithPointers);
+            FindNearbyAddressesWithPointersParallel(targetAddr, pointerMap, nearbyWithPointers, maxOffset);
             
             if (!nearbyWithPointers.empty()) {
                 SearchNearbyPointerPathsAutomatic(targetAddr, nearbyWithPointers, pointerMap, maxOffset, maxDepth);
@@ -1460,20 +1474,72 @@ public:
         }
     }
     
-    // Find nearby addresses that have pointers for structure-based searching
-    void FindNearbyAddressesWithPointers(DWORD_PTR targetAddr, 
-                                       const std::map<DWORD_PTR, std::vector<DWORD_PTR>>& pointerMap,
-                                       std::vector<std::pair<DWORD_PTR, int>>& nearbyWithPointers) {
+    // Fast parallelized structure scan using max offset range
+    void FindNearbyAddressesWithPointersParallel(DWORD_PTR targetAddr, 
+                                                const std::map<DWORD_PTR, std::vector<DWORD_PTR>>& pointerMap,
+                                                std::vector<std::pair<DWORD_PTR, int>>& nearbyWithPointers,
+                                                DWORD maxOffset) {
         
-        // Check a wider range for structure analysis
-        for (int offset = -256; offset <= 256; offset += 4) {
-            if (offset == 0) continue; // Skip the target itself
+        // Calculate scan range based on max offset (structure size assumption)
+        int scanRange = std::min((int)maxOffset, 8192); // Cap at 8KB for performance
+        int totalOffsets = (scanRange * 2) / 4; // Number of 4-byte aligned offsets to check
+        
+        std::cout << "Scanning ±" << scanRange << " bytes around target for structure pointers...\n";
+        StartProgress("STRUCTURE SCAN:", totalOffsets);
+        
+        // Determine optimal thread count for structure scanning
+        SYSTEM_INFO sysInfo;
+        GetSystemInfo(&sysInfo);
+        DWORD threadCount = std::min(sysInfo.dwNumberOfProcessors, (DWORD)4); // Max 4 threads for this
+        if (threadCount == 0) threadCount = 2;
+        
+        // Thread-safe results collection
+        std::vector<std::vector<std::pair<DWORD_PTR, int>>> threadResults(threadCount);
+        std::vector<HANDLE> threadHandles(threadCount);
+        std::vector<StructureScanData> threadDataArray(threadCount);
+        
+        // Divide offset range among threads
+        int offsetsPerThread = totalOffsets / threadCount;
+        
+        for (DWORD i = 0; i < threadCount; i++) {
+            int startOffset = -scanRange + (i * offsetsPerThread * 4);
+            int endOffset = (i == threadCount - 1) ? scanRange : (-scanRange + ((i + 1) * offsetsPerThread * 4));
             
-            DWORD_PTR checkAddr = targetAddr + offset;
-            auto it = pointerMap.find(checkAddr);
-            if (it != pointerMap.end() && !it->second.empty()) {
-                nearbyWithPointers.push_back({checkAddr, offset});
+            threadDataArray[i].targetAddr = targetAddr;
+            threadDataArray[i].pointerMap = &pointerMap;
+            threadDataArray[i].results = &threadResults[i];
+            threadDataArray[i].startOffset = startOffset;
+            threadDataArray[i].endOffset = endOffset;
+            threadDataArray[i].memoryTool = this;
+            
+            threadHandles[i] = CreateThread(NULL, 0, StructureScanThreadProc, 
+                                          &threadDataArray[i], 0, NULL);
+        }
+        
+        // Monitor progress
+        int totalProcessed = 0;
+        while (totalProcessed < totalOffsets && !interruptSearch) {
+            // Calculate total progress from all threads
+            totalProcessed = 0;
+            for (DWORD i = 0; i < threadCount; i++) {
+                totalProcessed += threadDataArray[i].processed;
             }
+            UpdateProgress(totalProcessed);
+            Sleep(50);
+        }
+        
+        // Wait for all threads to complete
+        WaitForMultipleObjects(threadCount, threadHandles.data(), TRUE, INFINITE);
+        
+        // Clean up thread handles
+        for (HANDLE handle : threadHandles) {
+            CloseHandle(handle);
+        }
+        
+        // Merge results from all threads
+        for (const auto& threadResult : threadResults) {
+            nearbyWithPointers.insert(nearbyWithPointers.end(), 
+                                    threadResult.begin(), threadResult.end());
         }
         
         // Sort by number of pointers (most promising first)
@@ -1481,6 +1547,8 @@ public:
                  [&pointerMap](const std::pair<DWORD_PTR, int>& a, const std::pair<DWORD_PTR, int>& b) {
                      return pointerMap.at(a.first).size() > pointerMap.at(b.first).size();
                  });
+        
+        FinishProgress("Found " + std::to_string(nearbyWithPointers.size()) + " structure candidates");
     }
     
     // Automatic search for pointer paths to nearby addresses (Cheat Engine style)
@@ -1906,6 +1974,38 @@ DWORD WINAPI ScanRegionsThreadProc(LPVOID lpParam) {
     try {
         data->memoryTool->ScanRegionsThreaded(*data->pointerMap, *data->regions, 
                                             data->startIdx, data->endIdx);
+    } catch (...) {
+        // Handle any exceptions in thread
+    }
+    
+    return 0;
+}
+
+// Windows thread procedure for structure scanning
+DWORD WINAPI StructureScanThreadProc(LPVOID lpParam) {
+    StructureScanData* data = static_cast<StructureScanData*>(lpParam);
+    
+    try {
+        data->processed = 0;
+        
+        // Scan assigned offset range
+        for (int offset = data->startOffset; offset <= data->endOffset; offset += 4) {
+            if (offset == 0) continue; // Skip the target itself
+            
+            DWORD_PTR checkAddr = data->targetAddr + offset;
+            auto it = data->pointerMap->find(checkAddr);
+            if (it != data->pointerMap->end() && !it->second.empty()) {
+                data->results->push_back({checkAddr, offset});
+            }
+            
+            // Update progress counter
+            InterlockedIncrement(&data->processed);
+            
+            // Check for early termination
+            if (data->memoryTool && data->memoryTool->interruptSearch) {
+                break;
+            }
+        }
     } catch (...) {
         // Handle any exceptions in thread
     }

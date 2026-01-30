@@ -1562,6 +1562,7 @@ public:
         // Limit to top candidates to prevent excessive processing
         size_t candidatesToProcess = std::min((size_t)20, nearbyWithPointers.size());
         std::cout << "Processing top " << candidatesToProcess << " structure candidates...\n";
+        std::cout << "Press 'p' at any time to see all paths found so far, or 'q' to stop search.\n";
         
         // Calculate total work units (candidates × modules)
         int totalWorkUnits = candidatesToProcess * moduleMap.size();
@@ -1595,6 +1596,20 @@ public:
             for (const auto& module : moduleMap) {
                 if (interruptSearch) break;
                 
+                // Check for user input
+                if (_kbhit()) {
+                    char key = _getch();
+                    if (key == 'p' || key == 'P') {
+                        std::cout << "\n=== PATHS FOUND SO FAR ===\n";
+                        DisplayCurrentPaths();
+                        std::cout << "=== CONTINUING SEARCH ===\n";
+                    } else if (key == 'q' || key == 'Q') {
+                        std::cout << "\nSearch interrupted by user.\n";
+                        interruptSearch = true;
+                        break;
+                    }
+                }
+                
                 moduleIndex++;
                 std::cout << "  Checking " << module.first << "... ";
                 std::cout.flush();
@@ -1605,11 +1620,30 @@ public:
                 int pathsFound = pointerResults.size() - pathsBefore;
                 
                 if (pathsFound > 0) {
-                    std::cout << "Found " << pathsFound << " paths!";
+                    std::cout << "Found " << pathsFound << " paths!" << std::endl;
+                    
+                    // Show the newly found paths immediately
+                    std::cout << "  New paths found:\n";
+                    for (int i = pathsBefore; i < (int)pointerResults.size(); i++) {
+                        const auto& path = pointerResults[i];
+                        std::cout << "    " << (i + 1) << ": [[" << path.baseName << "+0x" << std::hex << path.offsets[0] << "]";
+                        for (size_t j = 1; j < path.offsets.size(); j++) {
+                            if (j == path.offsets.size() - 1 && path.finalOffset != 0) {
+                                if (path.offsets[j] >= 0) {
+                                    std::cout << "+0x" << path.offsets[j];
+                                } else {
+                                    std::cout << "-0x" << (-path.offsets[j]);
+                                }
+                            } else {
+                                std::cout << "+0x" << path.offsets[j];
+                            }
+                        }
+                        std::cout << "] = 0x" << path.finalAddress << std::dec << std::endl;
+                    }
+                    std::cout << std::endl;
                 } else {
-                    std::cout << "No paths";
+                    std::cout << "No paths" << std::endl;
                 }
-                std::cout << std::endl;
                 
                 InterlockedIncrement(&workUnitsCompleted);
                 UpdateProgress(workUnitsCompleted);
@@ -1622,10 +1656,47 @@ public:
                 }
             }
             
+            // Show summary for this candidate
+            int candidatePaths = 0;
+            for (const auto& path : pointerResults) {
+                if (path.originalTarget == originalTarget) candidatePaths++;
+            }
+            std::cout << "Candidate " << (candidateIdx + 1) << " total: " << candidatePaths << " paths found so far.\n\n";
+            
             if (pointerResults.size() >= 50) break;
         }
         
         FinishProgress("Found " + std::to_string(pointerResults.size()) + " complete paths");
+    }
+    
+    // Display current paths found during search
+    void DisplayCurrentPaths() {
+        if (pointerResults.empty()) {
+            std::cout << "No paths found yet.\n";
+            return;
+        }
+        
+        std::cout << "Current Paths Found (" << pointerResults.size() << " total):\n";
+        std::cout << "Index | Complete Pointer Path = Final Address\n";
+        std::cout << "------|------------------------------------------\n";
+        
+        for (size_t i = 0; i < pointerResults.size(); i++) {
+            const auto& path = pointerResults[i];
+            std::cout << std::setw(5) << i << " | [[" << path.baseName << "+0x" << std::hex << path.offsets[0] << "]";
+            for (size_t j = 1; j < path.offsets.size(); j++) {
+                if (j == path.offsets.size() - 1 && path.finalOffset != 0) {
+                    if (path.offsets[j] >= 0) {
+                        std::cout << "+0x" << path.offsets[j];
+                    } else {
+                        std::cout << "-0x" << (-path.offsets[j]);
+                    }
+                } else {
+                    std::cout << "+0x" << path.offsets[j];
+                }
+            }
+            std::cout << "] = 0x" << path.finalAddress << std::dec << "\n";
+        }
+        std::cout << std::endl;
     }
     
     // Search pointer chains and automatically add the structure offset

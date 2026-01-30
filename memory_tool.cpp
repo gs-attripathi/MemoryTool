@@ -1147,11 +1147,11 @@ public:
             
             if (!nearbyWithPointers.empty()) {
                 SearchNearbyPointerPathsAutomatic(targetAddr, nearbyWithPointers, pointerMap, maxOffset, maxDepth);
-                
-                if (!pointerResults.empty()) {
+        
+        if (!pointerResults.empty()) {
                     std::cout << "\nPointer search completed.\n";
                     DisplayPointerResults();
-                    SavePointerResults();
+            SavePointerResults();
                     return;
                 }
             }
@@ -1253,7 +1253,7 @@ public:
         while (VirtualQueryEx(processHandle, (LPCVOID)address, &mbi, sizeof(mbi))) {
             // Cheat Engine optimization: Only scan specific memory types
             bool isScannable = (mbi.State == MEM_COMMIT && 
-                               (mbi.Protect & PAGE_GUARD) == 0 && 
+                (mbi.Protect & PAGE_GUARD) == 0 && 
                                (mbi.Protect & PAGE_NOACCESS) == 0);
             
             // Focus on likely pointer-containing regions
@@ -1271,7 +1271,7 @@ public:
             address = (DWORD_PTR)mbi.BaseAddress + mbi.RegionSize;
         }
     }
-    
+
     // Thread worker function for scanning regions (Windows native)
     void ScanRegionsThreaded(std::map<DWORD_PTR, std::vector<DWORD_PTR>>& pointerMap,
                            const std::vector<std::pair<DWORD_PTR, SIZE_T>>& regions,
@@ -1680,7 +1680,7 @@ public:
     // Sort pointer results by relevance (game modules first, system modules last)
     void SortPointerResultsByRelevance() {
         std::sort(pointerResults.begin(), pointerResults.end(), 
-                 [](const PointerPath& a, const PointerPath& b) {
+                 [this](const PointerPath& a, const PointerPath& b) {
                      // Calculate relevance score for each path
                      int scoreA = GetModuleRelevanceScore(a.baseName);
                      int scoreB = GetModuleRelevanceScore(b.baseName);
@@ -1801,7 +1801,7 @@ public:
             SIZE_T bytesRead;
             
             if (!ReadProcessMemory(processHandle, (LPCVOID)checkAddr, 
-                                 &value, sizeof(value), &bytesRead)) {
+                                &value, sizeof(value), &bytesRead)) {
                 continue;
             }
             
@@ -1813,11 +1813,11 @@ public:
             // Check if this value points directly to our nearby target
             if (value == nearbyTarget) {
                 // Found a complete path! Create the final pointer path
-                PointerPath path;
-                path.baseName = baseName;
+                        PointerPath path;
+                        path.baseName = baseName;
                 path.baseAddress = currentAddr;
                 path.offsets = currentPath;
-                path.offsets.push_back(offset);
+                        path.offsets.push_back(offset);
                 
                 // DON'T add structure offset as an offset - it's handled in final address calculation
                 // The path points to nearbyTarget, finalAddress is calculated as nearbyTarget + structOffset
@@ -1829,7 +1829,7 @@ public:
                 
                 // Validate this is a reasonable pointer path AND actually works
                 if (IsReasonablePointerPath(path) && ValidatePointerPath(path)) {
-                    pointerResults.push_back(path);
+                        pointerResults.push_back(path);
                     pathsFound++;
                 }
                 
@@ -2010,7 +2010,7 @@ public:
                 path.offsets.push_back(offset);
                 path.finalAddress = targetAddr;
                 path.depth = currentDepth + 1;
-                pointerResults.push_back(path);
+                            pointerResults.push_back(path);
                 pathsFound++;
                 
                 // Display the path
@@ -2096,7 +2096,7 @@ public:
             for (size_t i = 1; i < example.offsets.size(); i++) {
                 if (i == example.offsets.size() - 1 && example.finalOffset != 0) {
                     if (example.offsets[i] >= 0) {
-                        std::cout << "+0x" << example.offsets[i];
+                std::cout << "+0x" << example.offsets[i];
                     } else {
                         std::cout << "-0x" << (-example.offsets[i]);
                     }

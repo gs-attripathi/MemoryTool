@@ -40,6 +40,8 @@ struct PointerPath {
     DWORD_PTR baseAddress;
     std::vector<DWORD> offsets;
     DWORD_PTR finalAddress;
+    DWORD_PTR originalTarget;  // The actual target we're looking for
+    int finalOffset;           // Additional offset to reach original target
     int depth;
 };
 
@@ -1124,25 +1126,24 @@ public:
             std::cout << "3. Target is pointed to by calculated addresses (not static pointers)\n";
             std::cout << "4. Target is in a memory region we filtered out\n";
             
-            // Check if we should try nearby addresses that have pointers
+            // Automatically search nearby addresses (Cheat Engine behavior)
+            std::cout << "\nAutomatically searching nearby addresses for structure-based pointers...\n";
             std::vector<std::pair<DWORD_PTR, int>> nearbyWithPointers;
             FindNearbyAddressesWithPointers(targetAddr, pointerMap, nearbyWithPointers);
             
             if (!nearbyWithPointers.empty()) {
-                std::cout << "\nWould you like to search for pointer paths to nearby addresses?\n";
-                std::cout << "This often works when your target is part of a larger structure.\n";
-                std::cout << "Enter 'y' to try nearby addresses, or any other key to exit: ";
+                SearchNearbyPointerPathsAutomatic(targetAddr, nearbyWithPointers, pointerMap, maxOffset, maxDepth);
                 
-                char choice;
-                std::cin >> choice;
-                
-                if (choice == 'y' || choice == 'Y') {
-                    SearchNearbyPointerPaths(targetAddr, nearbyWithPointers, pointerMap, maxOffset, maxDepth);
+                if (!pointerResults.empty()) {
+                    std::cout << "\nPointer search completed.\n";
+                    DisplayPointerResults();
+                    SavePointerResults();
                     return;
                 }
             }
             
-            std::cout << "\nTry: Find the value again and immediately search for pointers.\n";
+            std::cout << "\nNo pointer paths found to target or nearby addresses.\n";
+            std::cout << "Target might be in dynamically allocated memory (heap/stack).\n";
             return;
         }
         
@@ -1482,83 +1483,120 @@ public:
                  });
     }
     
-    // Search for pointer paths to nearby addresses
-    void SearchNearbyPointerPaths(DWORD_PTR originalTarget,
-                                const std::vector<std::pair<DWORD_PTR, int>>& nearbyWithPointers,
-                                const std::map<DWORD_PTR, std::vector<DWORD_PTR>>& pointerMap,
-                                DWORD maxOffset, int maxDepth) {
+    // Automatic search for pointer paths to nearby addresses (Cheat Engine style)
+    void SearchNearbyPointerPathsAutomatic(DWORD_PTR originalTarget,
+                                          const std::vector<std::pair<DWORD_PTR, int>>& nearbyWithPointers,
+                                          const std::map<DWORD_PTR, std::vector<DWORD_PTR>>& pointerMap,
+                                          DWORD maxOffset, int maxDepth) {
         
-        std::cout << "\nSearching pointer paths to nearby addresses...\n";
+        pointerResults.clear(); // Start fresh
         
-        int totalPathsFound = 0;
+        StartProgress("STRUCTURE SCAN:", std::min((size_t)10, nearbyWithPointers.size()));
+        
         int addressesTried = 0;
-        
         for (const auto& nearby : nearbyWithPointers) {
-            if (addressesTried >= 5) break; // Limit to top 5 candidates
+            if (addressesTried >= 10) break; // Limit to top 10 candidates
             
             DWORD_PTR nearbyAddr = nearby.first;
-            int offset = nearby.second;
+            int structOffset = nearby.second;
             
-            std::cout << "\nTrying address 0x" << std::hex << nearbyAddr << std::dec 
-                     << " (original" << std::showpos << offset << std::noshowpos << ")...\n";
-            
-            // Clear previous results and search this address
-            pointerResults.clear();
+            UpdateProgress(addressesTried + 1);
             
             // Get direct pointers to this nearby address
-            std::vector<DWORD_PTR> level0Pointers;
             auto it = pointerMap.find(nearbyAddr);
-            if (it != pointerMap.end()) {
-                level0Pointers = it->second;
-            }
-            
-            std::cout << "Found " << level0Pointers.size() << " direct pointers to this address.\n";
-            
-            if (!level0Pointers.empty()) {
-                // Search for pointer chains to this nearby address
-                StartProgress("POINTER CHAINS:", moduleMap.size());
+            if (it != pointerMap.end() && !it->second.empty()) {
                 
-                int moduleIndex = 0;
+                // Search for pointer chains to this nearby address
                 for (const auto& module : moduleMap) {
                     if (interruptSearch) break;
                     
-                    moduleIndex++;
-                    UpdateProgress(moduleIndex);
-                    
-                    SearchPointerChains(module.second, module.first, nearbyAddr, 
-                                      pointerMap, maxOffset, maxDepth);
-                }
-                
-                FinishProgress("Found " + std::to_string(pointerResults.size()) + " pointer paths");
-                
-                if (!pointerResults.empty()) {
-                    std::cout << "\nPointer paths to nearby address (add " << std::showpos << offset << std::noshowpos << " to reach original target):\n";
-                    DisplayPointerResults();
-                    
-                    // Modify the displayed results to show the final calculation
-                    std::cout << "\nTo reach your original target (0x" << std::hex << originalTarget << std::dec << "):\n";
-                    std::cout << "Use these pointer paths and add " << std::showpos << offset << std::noshowpos << " to the final result.\n";
-                    std::cout << "Example: If path gives you 0x" << std::hex << nearbyAddr << std::dec 
-                             << ", then 0x" << std::hex << nearbyAddr << std::dec << std::showpos << offset << std::noshowpos 
-                             << " = 0x" << std::hex << originalTarget << std::dec << "\n";
-                    
-                    totalPathsFound += pointerResults.size();
-                    
-                    if (!pointerResults.empty()) {
-                        SavePointerResults();
-                    }
+                    SearchPointerChainsWithOffset(module.second, module.first, nearbyAddr, 
+                                                originalTarget, structOffset, pointerMap, maxOffset, maxDepth);
                 }
             }
             
             addressesTried++;
         }
         
-        if (totalPathsFound == 0) {
-            std::cout << "\nNo pointer paths found to nearby addresses either.\n";
-            std::cout << "This target might be in dynamically allocated memory (heap/stack).\n";
-        } else {
-            std::cout << "\nTotal paths found: " << totalPathsFound << "\n";
+        FinishProgress("Found " + std::to_string(pointerResults.size()) + " complete paths");
+    }
+    
+    // Search pointer chains and automatically add the structure offset
+    void SearchPointerChainsWithOffset(DWORD_PTR baseAddr, const std::string& baseName, 
+                                     DWORD_PTR nearbyTarget, DWORD_PTR originalTarget, int structOffset,
+                                     const std::map<DWORD_PTR, std::vector<DWORD_PTR>>& pointerMap,
+                                     DWORD maxOffset, int maxDepth) {
+        
+        std::vector<DWORD> currentPath;
+        SearchPointerChainRecursiveWithOffset(baseAddr, baseName, nearbyTarget, originalTarget, 
+                                            structOffset, pointerMap, maxOffset, maxDepth, currentPath, 0);
+    }
+    
+    // Recursive pointer chain search that creates complete paths to original target
+    int SearchPointerChainRecursiveWithOffset(DWORD_PTR currentAddr, const std::string& baseName,
+                                            DWORD_PTR nearbyTarget, DWORD_PTR originalTarget, int structOffset,
+                                            const std::map<DWORD_PTR, std::vector<DWORD_PTR>>& pointerMap,
+                                            DWORD maxOffset, int maxDepth,
+                                            std::vector<DWORD>& currentPath, int currentDepth) {
+        
+        if (interruptSearch || currentDepth >= maxDepth) return 0;
+        
+        int pathsFound = 0;
+        
+        // Try different offsets from current address
+        for (DWORD offset = 0; offset <= maxOffset && !interruptSearch; offset += 4) {
+            DWORD_PTR checkAddr = currentAddr + offset;
+            DWORD_PTR value;
+            SIZE_T bytesRead;
+            
+            if (!ReadProcessMemory(processHandle, (LPCVOID)checkAddr, 
+                                 &value, sizeof(value), &bytesRead)) {
+                continue;
+            }
+            
+            // Check if this value points directly to our nearby target
+            if (value == nearbyTarget) {
+                // Found a complete path! Create the final pointer path
+                PointerPath path;
+                path.baseName = baseName;
+                path.baseAddress = currentAddr;
+                path.offsets = currentPath;
+                path.offsets.push_back(offset);
+                
+                // Add the structure offset as the final offset
+                if (structOffset != 0) {
+                    path.offsets.push_back(structOffset);
+                }
+                
+                path.finalAddress = originalTarget;  // This is what the path actually resolves to
+                path.originalTarget = originalTarget;
+                path.finalOffset = structOffset;
+                path.depth = currentDepth + 1 + (structOffset != 0 ? 1 : 0);
+                
+                pointerResults.push_back(path);
+                pathsFound++;
+                
+                if (pathsFound >= 20) return pathsFound; // Limit results per module
+                continue;
+            }
+            
+            // Check if this value is in our pointer map (points to something useful)
+            auto it = pointerMap.find(value);
+            if (it != pointerMap.end() && currentDepth < maxDepth - 1) {
+                // Recursively search from this new address
+                std::vector<DWORD> newPath = currentPath;
+                newPath.push_back(offset);
+                
+                int subPaths = SearchPointerChainRecursiveWithOffset(value, baseName, nearbyTarget, originalTarget,
+                                                                   structOffset, pointerMap, maxOffset, maxDepth,
+                                                                   newPath, currentDepth + 1);
+                pathsFound += subPaths;
+                
+                if (pathsFound >= 20) return pathsFound; // Limit results
+            }
         }
+        
+        return pathsFound;
     }
     
     // Fast pointer validation without expensive system calls
@@ -1682,48 +1720,66 @@ public:
         return pathsFound;
     }
 
-    // Display pointer search results
+    // Display pointer search results in Cheat Engine format
     void DisplayPointerResults() {
         if (pointerResults.empty()) {
             std::cout << "No pointer paths found.\n";
             return;
         }
         
-        std::cout << "\nPointer Paths Found:\n";
-        std::cout << "Index | Pointer Path | Final Address\n";
-        std::cout << "------|--------------|---------------\n";
+        std::cout << "\nPointer Paths Found (Cheat Engine Format):\n";
+        std::cout << "Index | Complete Pointer Path = Final Address\n";
+        std::cout << "------|------------------------------------------\n";
         
-        for (size_t i = 0; i < std::min(pointerResults.size(), (size_t)20); i++) {
+        for (size_t i = 0; i < std::min(pointerResults.size(), (size_t)50); i++) {
             const auto& path = pointerResults[i];
             std::cout << std::setw(5) << i << " | ";
             
-            // Format pointer path
+            // Format complete pointer path exactly like Cheat Engine
             std::cout << "[[" << path.baseName << "+0x" << std::hex << path.offsets[0] << "]";
             for (size_t j = 1; j < path.offsets.size(); j++) {
-                std::cout << "+0x" << path.offsets[j];
+                if (j == path.offsets.size() - 1 && path.finalOffset != 0) {
+                    // Last offset - show with proper sign
+                    if (path.offsets[j] >= 0) {
+                        std::cout << "+0x" << path.offsets[j];
+                    } else {
+                        std::cout << "-0x" << (-path.offsets[j]);
+                    }
+                } else {
+                    std::cout << "+0x" << path.offsets[j];
+                }
             }
-            std::cout << "] | 0x" << path.finalAddress << std::dec << "\n";
+            std::cout << "] = 0x" << path.finalAddress << std::dec << "\n";
         }
         
-        if (pointerResults.size() > 20) {
-            std::cout << "... and " << (pointerResults.size() - 20) << " more paths.\n";
+        if (pointerResults.size() > 50) {
+            std::cout << "... and " << (pointerResults.size() - 50) << " more paths.\n";
         }
         
-        // Show how to use the pointer paths
+        // Show usage example
         if (!pointerResults.empty()) {
-            std::cout << "\nHow to use pointer paths:\n";
+            std::cout << "\nUsage Example:\n";
             const auto& example = pointerResults[0];
-            std::cout << "Example: " << example.baseName << "+0x" << std::hex << example.offsets[0];
+            std::cout << "Pointer Path: [[" << example.baseName << "+0x" << std::hex << example.offsets[0] << "]";
+            for (size_t i = 1; i < example.offsets.size(); i++) {
+                if (i == example.offsets.size() - 1 && example.finalOffset != 0) {
+                    if (example.offsets[i] >= 0) {
+                        std::cout << "+0x" << example.offsets[i];
+                    } else {
+                        std::cout << "-0x" << (-example.offsets[i]);
+                    }
+                } else {
+                    std::cout << "+0x" << example.offsets[i];
+                }
+            }
+            std::cout << "]\n";
+            std::cout << "This resolves to: 0x" << example.finalAddress << std::dec << " (your target address)\n";
+            std::cout << "\nIn your trainer/cheat:\n";
+            std::cout << "DWORD_PTR target = ReadPointer([[" << example.baseName << "+0x" << std::hex << example.offsets[0] << "]";
             for (size_t i = 1; i < example.offsets.size(); i++) {
                 std::cout << "+0x" << example.offsets[i];
             }
-            std::cout << std::dec << "\n";
-            std::cout << "This means: Read value at (" << example.baseName << " base + 0x" 
-                     << std::hex << example.offsets[0] << std::dec << ")";
-            for (size_t i = 1; i < example.offsets.size(); i++) {
-                std::cout << ", then add 0x" << std::hex << example.offsets[i] << std::dec;
-            }
-            std::cout << " to get final address.\n";
+            std::cout << "]);" << std::dec << "\n";
         }
     }
 

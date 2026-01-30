@@ -83,7 +83,7 @@ private:
     bool targetIs64Bit;
     size_t targetPointerSize;
     DWORD_PTR targetPointerAlignment;
-    DWORD_PTR targetMaxUserAddress;
+    uint64_t targetMaxUserAddress;
     
     // Progress tracking for in-place logging
     std::string currentScanType;
@@ -103,7 +103,7 @@ public:
 
     MemoryTool() : processHandle(NULL), processId(0), interruptSearch(false), 
                    targetIs64Bit(false), targetPointerSize(sizeof(DWORD_PTR)),
-                   targetPointerAlignment(4), targetMaxUserAddress(0x7FFFFFFF),
+                   targetPointerAlignment(4), targetMaxUserAddress(0x7FFFFFFFULL),
                    regionsProcessed(0), totalPointersFound(0), criticalSectionInitialized(false) {
         InitializeCriticalSection(&pointerMapCriticalSection);
         InitializeCriticalSection(&counterCriticalSection);
@@ -192,14 +192,20 @@ public:
     // Determine target process architecture for correct pointer size
     void InitializeTargetArchitecture() {
         SYSTEM_INFO sysInfo;
-        GetNativeSystemInfo(&sysInfo);
+        GetSystemInfo(&sysInfo);
 
         bool isOS64Bit = (sysInfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 ||
-                          sysInfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64);
+                          sysInfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_IA64);
 
         BOOL isWow64 = FALSE;
         if (isOS64Bit) {
-            IsWow64Process(processHandle, &isWow64);
+            // Use dynamic lookup for IsWow64Process to support older MinGW headers
+            typedef BOOL (WINAPI *LPFN_ISWOW64PROCESS)(HANDLE, PBOOL);
+            LPFN_ISWOW64PROCESS fnIsWow64Process =
+                (LPFN_ISWOW64PROCESS)GetProcAddress(GetModuleHandleA("kernel32.dll"), "IsWow64Process");
+            if (fnIsWow64Process) {
+                fnIsWow64Process(processHandle, &isWow64);
+            }
             targetIs64Bit = !isWow64; // if not WOW64, target is 64-bit
         } else {
             targetIs64Bit = false;
@@ -1891,7 +1897,7 @@ public:
             }
             
             // Quick validation: Is this a reasonable pointer value?
-            if (value < 0x10000 || value > targetMaxUserAddress || (value & (targetPointerAlignment - 1)) != 0) {
+            if (value < 0x10000 || static_cast<uint64_t>(value) > targetMaxUserAddress || (value & (targetPointerAlignment - 1)) != 0) {
                 continue;
             }
             
@@ -1947,7 +1953,7 @@ public:
     bool IsValidPointerFast(DWORD_PTR value) {
         // Basic range checks (very fast)
         if (value < 0x10000) return false;           // Too low
-        if (value > targetMaxUserAddress) return false;    // Too high for user space
+        if (static_cast<uint64_t>(value) > targetMaxUserAddress) return false;    // Too high for user space
         if ((value & (targetPointerAlignment - 1)) != 0) return false; // Not aligned
         
         // Cheat Engine optimization: Skip expensive VirtualQueryEx for speed
@@ -2028,7 +2034,7 @@ public:
     bool IsValidPointer(DWORD_PTR value) {
         // Basic pointer validation
         if (value < 0x10000) return false; // Too low
-        if (value > targetMaxUserAddress) return false; // Too high for user space
+        if (static_cast<uint64_t>(value) > targetMaxUserAddress) return false; // Too high for user space
         if ((value & (targetPointerAlignment - 1)) != 0) return false; // Not aligned
         
         // Check if the address is actually readable

@@ -227,16 +227,25 @@ public:
         MEMORY_BASIC_INFORMATION mbi;
         DWORD_PTR address = 0;
         
+        int regionCount = 0;
+        int searchableRegions = 0;
+        
         while (VirtualQueryEx(processHandle, (LPCVOID)address, &mbi, sizeof(mbi))) {
+            regionCount++;
+            
             if (mbi.State == MEM_COMMIT && 
                 (mbi.Protect & PAGE_GUARD) == 0 && 
                 (mbi.Protect & PAGE_NOACCESS) == 0) {
                 
+                searchableRegions++;
                 SearchInRegion((DWORD_PTR)mbi.BaseAddress, mbi.RegionSize, searchBytes, type);
             }
             
             address = (DWORD_PTR)mbi.BaseAddress + mbi.RegionSize;
         }
+        
+        std::cout << "Scanned " << regionCount << " memory regions (" 
+                 << searchableRegions << " searchable)\n";
         
         std::cout << "Search complete. Found " << searchResults.size() << " results.\n";
         DisplayResults();
@@ -499,40 +508,65 @@ public:
 
     // Perform the actual pointer search
     void PerformPointerSearch(DWORD_PTR targetAddr, DWORD maxOffset, int maxDepth) {
-        // First, find all addresses that point to our target
-        std::set<DWORD_PTR> level0Pointers;
-        FindDirectPointers(targetAddr, level0Pointers);
+        std::cout << "Step 1: Finding direct pointers to target address...\n";
         
-        // For each module, try to find pointer paths
+        // First, find all addresses that point directly to our target
+        std::vector<DWORD_PTR> directPointers;
+        FindDirectPointersSimple(targetAddr, directPointers);
+        
+        std::cout << "Found " << directPointers.size() << " direct pointers.\n";
+        
+        if (directPointers.empty()) {
+            std::cout << "No direct pointers found. Target address might not be referenced.\n";
+            return;
+        }
+        
+        std::cout << "Step 2: Searching for static pointer paths...\n";
+        
+        // For each module, search for pointer paths
         for (const auto& module : moduleMap) {
             if (interruptSearch) break;
             
-            SearchPointerPaths(module.second, module.first, targetAddr, 
-                             level0Pointers, maxOffset, maxDepth, 1);
+            std::cout << "Checking module: " << module.first << " (base: 0x" 
+                     << std::hex << module.second << std::dec << ")\n";
+            
+            SearchStaticPointers(module.second, module.first, targetAddr, 
+                               directPointers, maxOffset, maxDepth);
         }
     }
 
-    // Find direct pointers to target address
-    void FindDirectPointers(DWORD_PTR targetAddr, std::set<DWORD_PTR>& pointers) {
+    // Find direct pointers to target address (simplified)
+    void FindDirectPointersSimple(DWORD_PTR targetAddr, std::vector<DWORD_PTR>& pointers) {
         MEMORY_BASIC_INFORMATION mbi;
         DWORD_PTR address = 0;
+        int regionsScanned = 0;
         
         while (VirtualQueryEx(processHandle, (LPCVOID)address, &mbi, sizeof(mbi)) && !interruptSearch) {
+            regionsScanned++;
+            
             if (mbi.State == MEM_COMMIT && 
                 (mbi.Protect & PAGE_GUARD) == 0 && 
                 (mbi.Protect & PAGE_NOACCESS) == 0) {
                 
-                FindPointersInRegion((DWORD_PTR)mbi.BaseAddress, mbi.RegionSize, 
-                                   targetAddr, pointers);
+                FindPointersInRegionSimple((DWORD_PTR)mbi.BaseAddress, mbi.RegionSize, 
+                                         targetAddr, pointers);
             }
             
             address = (DWORD_PTR)mbi.BaseAddress + mbi.RegionSize;
+            
+            // Show progress every 100 regions
+            if (regionsScanned % 100 == 0) {
+                std::cout << "Scanned " << regionsScanned << " regions, found " 
+                         << pointers.size() << " pointers so far...\n";
+            }
         }
+        
+        std::cout << "Finished scanning " << regionsScanned << " regions.\n";
     }
 
-    // Find pointers in specific memory region
-    void FindPointersInRegion(DWORD_PTR baseAddr, SIZE_T size, DWORD_PTR targetAddr, 
-                            std::set<DWORD_PTR>& pointers) {
+    // Find pointers in specific memory region (simplified)
+    void FindPointersInRegionSimple(DWORD_PTR baseAddr, SIZE_T size, DWORD_PTR targetAddr, 
+                                   std::vector<DWORD_PTR>& pointers) {
         const SIZE_T CHUNK_SIZE = 1024 * 1024;
         std::vector<BYTE> buffer(CHUNK_SIZE);
         
@@ -543,24 +577,32 @@ public:
             if (ReadProcessMemory(processHandle, (LPCVOID)(baseAddr + offset), 
                                 buffer.data(), readSize, &bytesRead)) {
                 
+                // Search for the target address value
                 for (SIZE_T i = 0; i <= bytesRead - sizeof(DWORD_PTR); i += sizeof(DWORD_PTR)) {
                     DWORD_PTR value = *(DWORD_PTR*)(buffer.data() + i);
                     if (value == targetAddr) {
-                        pointers.insert(baseAddr + offset + i);
+                        DWORD_PTR pointerAddr = baseAddr + offset + i;
+                        pointers.push_back(pointerAddr);
+                        
+                        // Limit results to prevent memory issues
+                        if (pointers.size() >= 10000) {
+                            std::cout << "Found 10000+ pointers, stopping search to prevent memory issues.\n";
+                            return;
+                        }
                     }
                 }
             }
         }
     }
 
-    // Search for pointer paths recursively
-    void SearchPointerPaths(DWORD_PTR baseAddr, const std::string& baseName, 
-                          DWORD_PTR targetAddr, const std::set<DWORD_PTR>& targetPointers,
-                          DWORD maxOffset, int maxDepth, int currentDepth) {
+    // Search for static pointers (simplified approach)
+    void SearchStaticPointers(DWORD_PTR baseAddr, const std::string& baseName, 
+                            DWORD_PTR targetAddr, const std::vector<DWORD_PTR>& directPointers,
+                            DWORD maxOffset, int maxDepth) {
         
-        if (currentDepth > maxDepth || interruptSearch) return;
+        int pathsFound = 0;
         
-        // Try different offsets from base
+        // Level 1: Direct pointers from static base
         for (DWORD offset = 0; offset <= maxOffset && !interruptSearch; offset += 4) {
             DWORD_PTR checkAddr = baseAddr + offset;
             DWORD_PTR value;
@@ -569,54 +611,56 @@ public:
             if (ReadProcessMemory(processHandle, (LPCVOID)checkAddr, 
                                 &value, sizeof(value), &bytesRead)) {
                 
-                if (currentDepth == 1) {
-                    // Check if this points directly to target
-                    if (value == targetAddr) {
+                // Check if this points directly to target
+                if (value == targetAddr) {
+                    PointerPath path;
+                    path.baseName = baseName;
+                    path.baseAddress = baseAddr;
+                    path.offsets.push_back(offset);
+                    path.finalAddress = targetAddr;
+                    path.depth = 1;
+                    pointerResults.push_back(path);
+                    pathsFound++;
+                    
+                    std::cout << "Found Level 1 pointer: " << baseName << "+0x" 
+                             << std::hex << offset << std::dec << " -> target\n";
+                }
+                
+                // Level 2: Check if this points to any direct pointer
+                for (DWORD_PTR directPtr : directPointers) {
+                    if (value == directPtr) {
+                        // This static address points to a direct pointer
                         PointerPath path;
                         path.baseName = baseName;
                         path.baseAddress = baseAddr;
                         path.offsets.push_back(offset);
-                        path.finalAddress = targetAddr;
-                        path.depth = 1;
-                        pointerResults.push_back(path);
-                    }
-                    // Check if this points to any of our level 0 pointers
-                    else if (targetPointers.find(value) != targetPointers.end()) {
-                        PointerPath path;
-                        path.baseName = baseName;
-                        path.baseAddress = baseAddr;
-                        path.offsets.push_back(offset);
+                        path.offsets.push_back(0); // Assume 0 offset for now
                         path.finalAddress = targetAddr;
                         path.depth = 2;
+                        pointerResults.push_back(path);
+                        pathsFound++;
                         
-                        // Find the offset from the intermediate pointer to target
-                        DWORD_PTR intermediateValue;
-                        if (ReadProcessMemory(processHandle, (LPCVOID)value, 
-                                            &intermediateValue, sizeof(intermediateValue), &bytesRead)) {
-                            if (intermediateValue == targetAddr) {
-                                path.offsets.push_back(0);
-                            } else {
-                                // Try to find the offset
-                                for (DWORD intOffset = 0; intOffset <= maxOffset; intOffset += 4) {
-                                    DWORD_PTR testAddr = value + intOffset;
-                                    DWORD_PTR testValue;
-                                    if (ReadProcessMemory(processHandle, (LPCVOID)testAddr, 
-                                                        &testValue, sizeof(testValue), &bytesRead)) {
-                                        if (testValue == targetAddr) {
-                                            path.offsets.push_back(intOffset);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        std::cout << "Found Level 2 pointer: " << baseName << "+0x" 
+                                 << std::hex << offset << std::dec << "+0x0 -> target\n";
                         
-                        if (path.offsets.size() == 2) {
-                            pointerResults.push_back(path);
+                        // Limit results
+                        if (pathsFound >= 50) {
+                            std::cout << "Found 50+ paths for " << baseName << ", stopping to prevent overflow.\n";
+                            return;
                         }
                     }
                 }
             }
+            
+            // Show progress
+            if (offset % 1000 == 0 && offset > 0) {
+                std::cout << "Checked " << baseName << " up to offset 0x" 
+                         << std::hex << offset << std::dec << "...\n";
+            }
+        }
+        
+        if (pathsFound > 0) {
+            std::cout << "Found " << pathsFound << " pointer paths in " << baseName << "\n";
         }
     }
 

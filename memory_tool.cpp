@@ -11,6 +11,7 @@
 #include <map>
 #include <set>
 #include <conio.h>
+#include <cmath>
 
 #pragma comment(lib, "psapi.lib")
 
@@ -200,6 +201,91 @@ public:
         return bytes;
     }
 
+    // Fuzzy matching for float values
+    bool IsFloatFuzzyMatch(float searchValue, float memoryValue) {
+        // Handle exact matches first
+        if (searchValue == memoryValue) return true;
+        
+        // Check if search value is integer-like (e.g., 681.0)
+        if (searchValue == (float)(int)searchValue) {
+            // If searching for "681", match 681.xxx
+            return (int)searchValue == (int)memoryValue;
+        }
+        
+        // For decimal searches (e.g., 681.2), use precision-based matching
+        // Count decimal places in search value to determine tolerance
+        std::string searchStr = std::to_string(searchValue);
+        size_t decimalPos = searchStr.find('.');
+        if (decimalPos != std::string::npos) {
+            // Remove trailing zeros
+            while (searchStr.back() == '0') searchStr.pop_back();
+            if (searchStr.back() == '.') searchStr.pop_back();
+            
+            int decimalPlaces = searchStr.length() - decimalPos - 1;
+            if (decimalPlaces > 0) {
+                float tolerance = std::pow(10.0f, -(float)decimalPlaces) * 0.5f;
+                return std::abs(searchValue - memoryValue) <= tolerance;
+            }
+        }
+        
+        // Default tolerance for edge cases
+        return std::abs(searchValue - memoryValue) <= 0.001f;
+    }
+
+    // Fuzzy matching for double values
+    bool IsDoubleFuzzyMatch(double searchValue, double memoryValue) {
+        // Handle exact matches first
+        if (searchValue == memoryValue) return true;
+        
+        // Check if search value is integer-like (e.g., 681.0)
+        if (searchValue == (double)(long long)searchValue) {
+            // If searching for "681", match 681.xxx
+            return (long long)searchValue == (long long)memoryValue;
+        }
+        
+        // For decimal searches, use precision-based matching
+        std::string searchStr = std::to_string(searchValue);
+        size_t decimalPos = searchStr.find('.');
+        if (decimalPos != std::string::npos) {
+            // Remove trailing zeros
+            while (searchStr.back() == '0') searchStr.pop_back();
+            if (searchStr.back() == '.') searchStr.pop_back();
+            
+            int decimalPlaces = searchStr.length() - decimalPos - 1;
+            if (decimalPlaces > 0) {
+                double tolerance = std::pow(10.0, -(double)decimalPlaces) * 0.5;
+                return std::abs(searchValue - memoryValue) <= tolerance;
+            }
+        }
+        
+        // Default tolerance for edge cases
+        return std::abs(searchValue - memoryValue) <= 0.001;
+    }
+
+    // Add valid result with memory validation
+    template<typename T>
+    void AddValidResult(DWORD_PTR foundAddr, T actualValue, DataType type) {
+        // Validate that this address is in writable memory
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQueryEx(processHandle, (LPCVOID)foundAddr, &mbi, sizeof(mbi))) {
+            // Only include addresses in committed, writable memory
+            if (mbi.State == MEM_COMMIT && 
+                (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY))) {
+                
+                MemoryResult result;
+                result.address = foundAddr;
+                result.type = type;
+                result.size = sizeof(T);
+                
+                // Store the actual value found in memory
+                result.value.resize(sizeof(T));
+                memcpy(result.value.data(), &actualValue, sizeof(T));
+                
+                searchResults.push_back(result);
+            }
+        }
+    }
+ 
     // Get size for data type
     size_t GetTypeSize(DataType type) {
         switch (type) {
@@ -222,6 +308,9 @@ public:
         
         std::cout << "Searching for ";
         PrintValueWithType(searchBytes, type);
+        if (type == TYPE_FLOAT || type == TYPE_DOUBLE) {
+            std::cout << " (with fuzzy matching - will find similar decimal values)";
+        }
         std::cout << " in process memory...\n";
         
         MEMORY_BASIC_INFORMATION mbi;
@@ -251,10 +340,19 @@ public:
         DisplayResults();
     }
 
-    // Search in specific memory region
+    // Search in specific memory region with fuzzy matching for floats/doubles
     void SearchInRegion(DWORD_PTR baseAddr, SIZE_T size, const std::vector<BYTE>& searchBytes, DataType type) {
         const SIZE_T CHUNK_SIZE = 1024 * 1024; // 1MB chunks
         std::vector<BYTE> buffer(CHUNK_SIZE);
+        
+        // Extract search value for fuzzy matching
+        float searchFloat = 0.0f;
+        double searchDouble = 0.0;
+        if (type == TYPE_FLOAT) {
+            searchFloat = *(float*)searchBytes.data();
+        } else if (type == TYPE_DOUBLE) {
+            searchDouble = *(double*)searchBytes.data();
+        }
         
         for (SIZE_T offset = 0; offset < size; offset += CHUNK_SIZE) {
             SIZE_T readSize = std::min(CHUNK_SIZE, size - offset);
@@ -263,23 +361,44 @@ public:
             if (ReadProcessMemory(processHandle, (LPCVOID)(baseAddr + offset), 
                                 buffer.data(), readSize, &bytesRead)) {
                 
-                for (SIZE_T i = 0; i <= bytesRead - searchBytes.size(); i++) {
-                    if (memcmp(buffer.data() + i, searchBytes.data(), searchBytes.size()) == 0) {
-                        DWORD_PTR foundAddr = baseAddr + offset + i;
-                        
-                        // Validate that this address is in writable memory
-                        MEMORY_BASIC_INFORMATION mbi;
-                        if (VirtualQueryEx(processHandle, (LPCVOID)foundAddr, &mbi, sizeof(mbi))) {
-                            // Only include addresses in committed, writable memory
-                            if (mbi.State == MEM_COMMIT && 
-                                (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY))) {
-                                
-                                MemoryResult result;
-                                result.address = foundAddr;
-                                result.value = searchBytes;
-                                result.type = type;
-                                result.size = searchBytes.size();
-                                searchResults.push_back(result);
+                if (type == TYPE_FLOAT) {
+                    // Fuzzy matching for floats
+                    for (SIZE_T i = 0; i <= bytesRead - sizeof(float); i += sizeof(float)) {
+                        float memoryValue = *(float*)(buffer.data() + i);
+                        if (IsFloatFuzzyMatch(searchFloat, memoryValue)) {
+                            DWORD_PTR foundAddr = baseAddr + offset + i;
+                            AddValidResult(foundAddr, memoryValue, type);
+                        }
+                    }
+                } else if (type == TYPE_DOUBLE) {
+                    // Fuzzy matching for doubles
+                    for (SIZE_T i = 0; i <= bytesRead - sizeof(double); i += sizeof(double)) {
+                        double memoryValue = *(double*)(buffer.data() + i);
+                        if (IsDoubleFuzzyMatch(searchDouble, memoryValue)) {
+                            DWORD_PTR foundAddr = baseAddr + offset + i;
+                            AddValidResult(foundAddr, memoryValue, type);
+                        }
+                    }
+                } else {
+                    // Exact matching for other types
+                    for (SIZE_T i = 0; i <= bytesRead - searchBytes.size(); i++) {
+                        if (memcmp(buffer.data() + i, searchBytes.data(), searchBytes.size()) == 0) {
+                            DWORD_PTR foundAddr = baseAddr + offset + i;
+                            
+                            // Validate that this address is in writable memory
+                            MEMORY_BASIC_INFORMATION mbi;
+                            if (VirtualQueryEx(processHandle, (LPCVOID)foundAddr, &mbi, sizeof(mbi))) {
+                                // Only include addresses in committed, writable memory
+                                if (mbi.State == MEM_COMMIT && 
+                                    (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY))) {
+                                    
+                                    MemoryResult result;
+                                    result.address = foundAddr;
+                                    result.value = searchBytes;
+                                    result.type = type;
+                                    result.size = searchBytes.size();
+                                    searchResults.push_back(result);
+                                }
                             }
                         }
                     }

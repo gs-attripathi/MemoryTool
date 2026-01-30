@@ -1670,6 +1670,71 @@ public:
         }
         
         FinishProgress("Found " + std::to_string(pointerResults.size()) + " complete paths");
+        
+        // Sort results to show game modules first, system modules last (like Cheat Engine)
+        if (!pointerResults.empty()) {
+            SortPointerResultsByRelevance();
+        }
+    }
+    
+    // Sort pointer results by relevance (game modules first, system modules last)
+    void SortPointerResultsByRelevance() {
+        std::sort(pointerResults.begin(), pointerResults.end(), 
+                 [](const PointerPath& a, const PointerPath& b) {
+                     // Calculate relevance score for each path
+                     int scoreA = GetModuleRelevanceScore(a.baseName);
+                     int scoreB = GetModuleRelevanceScore(b.baseName);
+                     
+                     if (scoreA != scoreB) {
+                         return scoreA > scoreB; // Higher score first
+                     }
+                     
+                     // If same relevance, prefer shorter chains
+                     if (a.depth != b.depth) {
+                         return a.depth < b.depth;
+                     }
+                     
+                     // If same depth, prefer smaller structure offsets
+                     return abs(a.finalOffset) < abs(b.finalOffset);
+                 });
+    }
+    
+    // Get relevance score for a module (higher = more relevant for games)
+    int GetModuleRelevanceScore(const std::string& moduleName) {
+        std::string nameLower = moduleName;
+        std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
+        
+        // Game executables (highest priority)
+        if (nameLower.find(".exe") != std::string::npos) {
+            return 100;
+        }
+        
+        // Game-related DLLs (high priority)
+        std::vector<std::string> gameKeywords = {
+            "game", "engine", "unity", "unreal", "graphics", "render", 
+            "dx", "opengl", "vulkan", "steam", "client"
+        };
+        
+        for (const auto& keyword : gameKeywords) {
+            if (nameLower.find(keyword) != std::string::npos) {
+                return 80;
+            }
+        }
+        
+        // System DLLs (lower priority, but still shown)
+        std::vector<std::string> systemDlls = {
+            "kernel32", "ntdll", "user32", "advapi32", "gdi32", 
+            "shell32", "ole32", "winmm", "msvcrt"
+        };
+        
+        for (const auto& sysDll : systemDlls) {
+            if (nameLower.find(sysDll) != std::string::npos) {
+                return 10; // Low priority but still included
+            }
+        }
+        
+        // Unknown DLLs (medium priority)
+        return 50;
     }
     
     // Display current paths found during search
@@ -1762,8 +1827,8 @@ public:
                 path.finalOffset = structOffset;
                 path.depth = currentDepth + 1; // Correct depth - don't add extra for structure offset
                 
-                // Validate this is a reasonable pointer path before adding
-                if (IsReasonablePointerPath(path)) {
+                // Validate this is a reasonable pointer path AND actually works
+                if (IsReasonablePointerPath(path) && ValidatePointerPath(path)) {
                     pointerResults.push_back(path);
                     pathsFound++;
                 }
@@ -1805,49 +1870,75 @@ public:
         return true;
     }
     
-    // Validate if a pointer path is reasonable (filter out false positives)
+    // Validate if a pointer path is reasonable (minimal filtering like Cheat Engine)
     bool IsReasonablePointerPath(const PointerPath& path) {
-        // Filter out system DLLs - games rarely have pointers from system libraries
-        std::string baseLower = path.baseName;
-        std::transform(baseLower.begin(), baseLower.end(), baseLower.begin(), ::tolower);
+        // Only filter out obviously broken paths, not by module name
         
-        std::vector<std::string> systemDlls = {
-            "advapi32.dll", "kernel32.dll", "ntdll.dll", "user32.dll", 
-            "gdi32.dll", "audioses.dll", "winmm.dll", "ole32.dll",
-            "shell32.dll", "comctl32.dll", "msvcrt.dll", "ucrtbase.dll"
-        };
-        
-        for (const auto& sysDll : systemDlls) {
-            if (baseLower.find(sysDll) != std::string::npos) {
-                return false; // Skip system DLL pointers
-            }
-        }
-        
-        // Filter out excessively deep pointer chains (>6 levels is suspicious)
-        if (path.depth > 6) {
+        // Filter out excessively deep pointer chains (>8 levels is very unusual)
+        if (path.depth > 8) {
             return false;
         }
         
-        // Filter out paths with extremely large structure offsets
-        if (abs(path.finalOffset) > 8192) { // 8KB structure offset limit
+        // Filter out paths with extremely large structure offsets (>64KB is unrealistic)
+        if (abs(path.finalOffset) > 65536) {
             return false;
         }
         
-        // Filter out paths where all offsets are identical (suspicious pattern)
-        if (path.offsets.size() > 2) {
-            bool allSame = true;
-            for (size_t i = 1; i < path.offsets.size(); i++) {
-                if (path.offsets[i] != path.offsets[0]) {
-                    allSame = false;
-                    break;
-                }
-            }
-            if (allSame) {
-                return false; // Suspicious identical offset pattern
-            }
-        }
+        // Allow all modules - let user decide what's useful
+        // Cheat Engine shows all results and lets users filter manually
         
         return true;
+    }
+    
+    // Actually validate that a pointer path works by following it
+    bool ValidatePointerPath(const PointerPath& path) {
+        // Get the module base address
+        auto moduleIt = moduleMap.find(path.baseName);
+        if (moduleIt == moduleMap.end()) {
+            return false; // Module not found
+        }
+        
+        DWORD_PTR currentAddr = moduleIt->second; // Start with module base
+        
+        // Follow the pointer chain step by step
+        for (size_t i = 0; i < path.offsets.size(); i++) {
+            currentAddr += path.offsets[i];
+            
+            // If this is not the last step, read the pointer value
+            if (i < path.offsets.size() - 1) {
+                DWORD_PTR nextAddr;
+                SIZE_T bytesRead;
+                
+                if (!ReadProcessMemory(processHandle, (LPCVOID)currentAddr, 
+                                     &nextAddr, sizeof(nextAddr), &bytesRead)) {
+                    return false; // Can't read this step
+                }
+                
+                currentAddr = nextAddr;
+                
+                // Validate the intermediate address is reasonable
+                if (currentAddr < 0x10000 || currentAddr > 0x7FFFFFFFFFFF) {
+                    return false; // Invalid intermediate address
+                }
+            }
+        }
+        
+        // Apply the final structure offset
+        currentAddr += path.finalOffset;
+        
+        // Check if we actually reached the target address
+        if (currentAddr != path.finalAddress) {
+            return false; // Path doesn't lead to claimed target
+        }
+        
+        // Final validation: Can we read from the final address?
+        BYTE testData[4];
+        SIZE_T bytesRead;
+        if (!ReadProcessMemory(processHandle, (LPCVOID)currentAddr, testData, 4, &bytesRead)) {
+            return false; // Can't read final address
+        }
+        
+        return true; // Path is valid!
     }
     
     // Check if a value looks like a valid pointer

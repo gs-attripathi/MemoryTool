@@ -12,6 +12,7 @@
 #include <set>
 #include <conio.h>
 #include <cmath>
+#include <cstdint>
 
 #pragma comment(lib, "psapi.lib")
 
@@ -77,6 +78,12 @@ private:
     std::vector<MemoryResult> searchResults;
     std::vector<PointerPath> pointerResults;
     std::map<std::string, DWORD_PTR> moduleMap;
+
+    // Target architecture info
+    bool targetIs64Bit;
+    size_t targetPointerSize;
+    DWORD_PTR targetPointerAlignment;
+    DWORD_PTR targetMaxUserAddress;
     
     // Progress tracking for in-place logging
     std::string currentScanType;
@@ -95,6 +102,8 @@ public:
     volatile bool interruptSearch;
 
     MemoryTool() : processHandle(NULL), processId(0), interruptSearch(false), 
+                   targetIs64Bit(false), targetPointerSize(sizeof(DWORD_PTR)),
+                   targetPointerAlignment(4), targetMaxUserAddress(0x7FFFFFFF),
                    regionsProcessed(0), totalPointersFound(0), criticalSectionInitialized(false) {
         InitializeCriticalSection(&pointerMapCriticalSection);
         InitializeCriticalSection(&counterCriticalSection);
@@ -173,10 +182,41 @@ public:
             return false;
         }
 
+        InitializeTargetArchitecture();
         LoadModules();
         std::cout << "Successfully attached to: " << processName 
                  << " (PID: " << processId << " - 0x" << std::hex << processId << std::dec << ")\n";
         return true;
+    }
+
+    // Determine target process architecture for correct pointer size
+    void InitializeTargetArchitecture() {
+        SYSTEM_INFO sysInfo;
+        GetNativeSystemInfo(&sysInfo);
+
+        bool isOS64Bit = (sysInfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 ||
+                          sysInfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64);
+
+        BOOL isWow64 = FALSE;
+        if (isOS64Bit) {
+            IsWow64Process(processHandle, &isWow64);
+            targetIs64Bit = !isWow64; // if not WOW64, target is 64-bit
+        } else {
+            targetIs64Bit = false;
+        }
+
+        if (targetIs64Bit) {
+            targetPointerSize = 8;
+            targetPointerAlignment = 8;
+            targetMaxUserAddress = 0x00007FFFFFFFFFFFULL;
+        } else {
+            targetPointerSize = 4;
+            targetPointerAlignment = 4;
+            targetMaxUserAddress = 0xFFFFFFFFULL;
+        }
+
+        std::cout << "Target architecture: " << (targetIs64Bit ? "64-bit" : "32-bit")
+                  << " (pointer size: " << targetPointerSize << " bytes)\n";
     }
 
     // Load process modules for pointer base resolution
@@ -240,9 +280,15 @@ public:
                 break;
             }
             case TYPE_POINTER: {
-                DWORD_PTR val = std::stoull(value, nullptr, 16);
-                bytes.resize(sizeof(DWORD_PTR));
-                memcpy(bytes.data(), &val, sizeof(DWORD_PTR));
+                unsigned long long val = std::stoull(value, nullptr, 16);
+                bytes.resize(targetPointerSize);
+                if (targetPointerSize == 4) {
+                    uint32_t v32 = static_cast<uint32_t>(val);
+                    memcpy(bytes.data(), &v32, 4);
+                } else {
+                    uint64_t v64 = static_cast<uint64_t>(val);
+                    memcpy(bytes.data(), &v64, 8);
+                }
                 break;
             }
         }
@@ -343,7 +389,7 @@ public:
             case TYPE_4BYTE: return 4;
             case TYPE_FLOAT: return 4;
             case TYPE_DOUBLE: return 8;
-            case TYPE_POINTER: return sizeof(DWORD_PTR);
+            case TYPE_POINTER: return targetPointerSize;
             case TYPE_STRING: return 0; // Variable size
         }
         return 0;
@@ -525,7 +571,16 @@ public:
                 std::cout << "STRING: \"" << std::string(bytes.begin(), bytes.end() - 1) << "\"";
                 break;
             case TYPE_POINTER: {
-                DWORD_PTR val = *(DWORD_PTR*)bytes.data();
+                DWORD_PTR val = 0;
+                if (targetPointerSize == 4) {
+                    uint32_t v32;
+                    memcpy(&v32, bytes.data(), 4);
+                    val = static_cast<DWORD_PTR>(v32);
+                } else {
+                    uint64_t v64;
+                    memcpy(&v64, bytes.data(), 8);
+                    val = static_cast<DWORD_PTR>(v64);
+                }
                 std::cout << "POINTER: 0x" << std::hex << val << std::dec;
                 break;
             }
@@ -1194,6 +1249,7 @@ public:
         
         std::cout << "Found " << regions.size() << " scannable regions. Building pointer map...\n";
         StartProgress("POINTER MAP:", regions.size());
+        std::cout << std::endl;
         
         // Reset counters
         regionsProcessed = 0;
@@ -1334,6 +1390,37 @@ public:
         return pointersFound;
     }
     
+    // Read pointer value from buffer based on target pointer size
+    DWORD_PTR ReadPointerFromBuffer(const BYTE* data, SIZE_T offset) {
+        if (targetPointerSize == 4) {
+            uint32_t v32;
+            memcpy(&v32, data + offset, 4);
+            return static_cast<DWORD_PTR>(v32);
+        }
+        uint64_t v64;
+        memcpy(&v64, data + offset, 8);
+        return static_cast<DWORD_PTR>(v64);
+    }
+
+    // Read pointer value from process based on target pointer size
+    bool ReadPointerValue(DWORD_PTR address, DWORD_PTR& outValue) {
+        SIZE_T bytesRead = 0;
+        if (targetPointerSize == 4) {
+            uint32_t v32 = 0;
+            if (!ReadProcessMemory(processHandle, (LPCVOID)address, &v32, 4, &bytesRead) || bytesRead != 4) {
+                return false;
+            }
+            outValue = static_cast<DWORD_PTR>(v32);
+            return true;
+        }
+        uint64_t v64 = 0;
+        if (!ReadProcessMemory(processHandle, (LPCVOID)address, &v64, 8, &bytesRead) || bytesRead != 8) {
+            return false;
+        }
+        outValue = static_cast<DWORD_PTR>(v64);
+        return true;
+    }
+
     // Check if a memory chunk is likely to contain pointers
     bool IsLikelyPointerRegion(const BYTE* data, SIZE_T size) {
         if (size < 64) return false;
@@ -1342,12 +1429,12 @@ public:
         int totalChecked = 0;
         
         // Sample every 64 bytes to check if region contains pointer-like values
-        for (SIZE_T i = 0; i < size - sizeof(DWORD_PTR); i += 64) {
-            DWORD_PTR value = *(DWORD_PTR*)(data + i);
+        for (SIZE_T i = 0; i + targetPointerSize <= size && i < 256; i += 64) {
+            DWORD_PTR value = ReadPointerFromBuffer(data, i);
             totalChecked++;
             
             // Quick pointer validation (without expensive memory checks)
-            if (value > 0x10000 && value < 0x7FFFFFFFFFFF && (value & 0x3) == 0) {
+            if (IsValidPointerFast(value)) {
                 validPointerCount++;
             }
             
@@ -1364,8 +1451,8 @@ public:
         int pointersFound = 0;
         
         // Cheat Engine optimization: Use SIMD-friendly loop
-        for (SIZE_T i = 0; i <= size - sizeof(DWORD_PTR); i += sizeof(DWORD_PTR)) {
-            DWORD_PTR pointerValue = *(DWORD_PTR*)(data + i);
+        for (SIZE_T i = 0; i + targetPointerSize <= size; i += targetPointerAlignment) {
+            DWORD_PTR pointerValue = ReadPointerFromBuffer(data, i);
             
             // Fast pointer validation (most important optimization)
             if (IsValidPointerFast(pointerValue)) {
@@ -1798,15 +1885,13 @@ public:
         for (DWORD offset = 0; offset <= maxOffset && !interruptSearch; offset += step) {
             DWORD_PTR checkAddr = currentAddr + offset;
             DWORD_PTR value;
-            SIZE_T bytesRead;
-            
-            if (!ReadProcessMemory(processHandle, (LPCVOID)checkAddr, 
-                                &value, sizeof(value), &bytesRead)) {
+
+            if (!ReadPointerValue(checkAddr, value)) {
                 continue;
             }
             
             // Quick validation: Is this a reasonable pointer value?
-            if (value < 0x10000 || value > 0x7FFFFFFFFFFF || (value & 0x3) != 0) {
+            if (value < 0x10000 || value > targetMaxUserAddress || (value & (targetPointerAlignment - 1)) != 0) {
                 continue;
             }
             
@@ -1862,8 +1947,8 @@ public:
     bool IsValidPointerFast(DWORD_PTR value) {
         // Basic range checks (very fast)
         if (value < 0x10000) return false;           // Too low
-        if (value > 0x7FFFFFFFFFFF) return false;    // Too high for user space
-        if ((value & 0x3) != 0) return false;       // Not aligned to 4 bytes
+        if (value > targetMaxUserAddress) return false;    // Too high for user space
+        if ((value & (targetPointerAlignment - 1)) != 0) return false; // Not aligned
         
         // Cheat Engine optimization: Skip expensive VirtualQueryEx for speed
         // We'll validate these during pointer chain building instead
@@ -1907,10 +1992,8 @@ public:
             // If this is not the last step, read the pointer value
             if (i < path.offsets.size() - 1) {
                 DWORD_PTR nextAddr;
-                SIZE_T bytesRead;
-                
-                if (!ReadProcessMemory(processHandle, (LPCVOID)currentAddr, 
-                                     &nextAddr, sizeof(nextAddr), &bytesRead)) {
+
+                if (!ReadPointerValue(currentAddr, nextAddr)) {
                     return false; // Can't read this step
                 }
                 
@@ -1945,8 +2028,8 @@ public:
     bool IsValidPointer(DWORD_PTR value) {
         // Basic pointer validation
         if (value < 0x10000) return false; // Too low
-        if (value > 0x7FFFFFFFFFFF) return false; // Too high for user space
-        if ((value & 0x3) != 0) return false; // Not aligned to 4 bytes
+        if (value > targetMaxUserAddress) return false; // Too high for user space
+        if ((value & (targetPointerAlignment - 1)) != 0) return false; // Not aligned
         
         // Check if the address is actually readable
         MEMORY_BASIC_INFORMATION mbi;
@@ -1993,10 +2076,8 @@ public:
         for (DWORD offset = 0; offset <= maxOffset && !interruptSearch; offset += 4) {
             DWORD_PTR checkAddr = currentAddr + offset;
             DWORD_PTR value;
-            SIZE_T bytesRead;
-            
-            if (!ReadProcessMemory(processHandle, (LPCVOID)checkAddr, 
-                                 &value, sizeof(value), &bytesRead)) {
+
+            if (!ReadPointerValue(checkAddr, value)) {
                 continue;
             }
             

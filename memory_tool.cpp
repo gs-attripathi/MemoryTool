@@ -72,6 +72,7 @@ private:
     
     // Windows native threading for MinGW compatibility
     CRITICAL_SECTION pointerMapCriticalSection;
+    CRITICAL_SECTION counterCriticalSection;
     volatile LONG regionsProcessed;
     volatile LONG totalPointersFound;
     bool criticalSectionInitialized;
@@ -80,6 +81,7 @@ public:
     MemoryTool() : processHandle(NULL), processId(0), interruptSearch(false), 
                    regionsProcessed(0), totalPointersFound(0), criticalSectionInitialized(false) {
         InitializeCriticalSection(&pointerMapCriticalSection);
+        InitializeCriticalSection(&counterCriticalSection);
         criticalSectionInitialized = true;
     }
     
@@ -89,6 +91,7 @@ public:
         }
         if (criticalSectionInitialized) {
             DeleteCriticalSection(&pointerMapCriticalSection);
+            DeleteCriticalSection(&counterCriticalSection);
         }
     }
 
@@ -1137,7 +1140,7 @@ public:
         // Determine optimal thread count
         SYSTEM_INFO sysInfo;
         GetSystemInfo(&sysInfo);
-        DWORD threadCount = min(sysInfo.dwNumberOfProcessors, 8);
+        DWORD threadCount = std::min(sysInfo.dwNumberOfProcessors, (DWORD)8);
         if (threadCount == 0) threadCount = 4; // Fallback
         
         std::cout << "Using " << threadCount << " threads for scanning.\n";
@@ -1220,8 +1223,12 @@ public:
             SIZE_T size = regions[i].second;
             
             int regionPointers = ScanRegionForPointersOptimized(baseAddr, size, localMap);
-            InterlockedAdd(&totalPointersFound, regionPointers);
-            InterlockedIncrement(&regionsProcessed);
+            
+            // Thread-safe counter updates
+            EnterCriticalSection(&counterCriticalSection);
+            totalPointersFound += regionPointers;
+            regionsProcessed++;
+            LeaveCriticalSection(&counterCriticalSection);
         }
         
         // Merge local map into global map (thread-safe with critical section)

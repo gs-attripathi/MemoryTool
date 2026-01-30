@@ -1577,7 +1577,7 @@ public:
         int scanRange = std::min((int)maxOffset, 8192); // Cap at 8KB for performance
         int totalOffsets = (scanRange * 2) / 4; // Number of 4-byte aligned offsets to check
         
-        std::cout << "Scanning ±" << scanRange << " bytes around target for structure pointers...\n";
+        std::cout << "Scanning +/-" << scanRange << " bytes around target for structure pointers...\n";
         StartProgress("STRUCTURE SCAN:", totalOffsets);
         
         // Determine optimal thread count for structure scanning
@@ -1875,8 +1875,23 @@ public:
                                      DWORD maxOffset, int maxDepth) {
         
         std::vector<DWORD> currentPath;
+        DWORD startTick = GetTickCount();
+        DWORD lastLogTick = startTick;
+        int offsetsScanned = 0;
+        int pathsBefore = (int)pointerResults.size();
+        int logEveryOffsets = 250;
+        DWORD logEveryMs = 1000;
+
         SearchPointerChainRecursiveWithOffset(baseAddr, baseName, nearbyTarget, originalTarget, 
-                                            structOffset, pointerMap, maxOffset, maxDepth, currentPath, 0);
+                                            structOffset, pointerMap, maxOffset, maxDepth,
+                                            currentPath, 0, offsetsScanned, pathsBefore, startTick, lastLogTick,
+                                            logEveryOffsets, logEveryMs);
+
+        DWORD elapsed = GetTickCount() - startTick;
+        int pathsFound = (int)pointerResults.size() - pathsBefore;
+        std::cout << "  " << baseName << ": scanned " << offsetsScanned
+                  << " offsets, found " << pathsFound
+                  << " paths in " << elapsed << "ms\n";
     }
     
     // Optimized recursive pointer chain search with early termination
@@ -1884,14 +1899,17 @@ public:
                                             DWORD_PTR nearbyTarget, DWORD_PTR originalTarget, int structOffset,
                                             const std::map<DWORD_PTR, std::vector<DWORD_PTR>>& pointerMap,
                                             DWORD maxOffset, int maxDepth,
-                                            std::vector<DWORD>& currentPath, int currentDepth) {
+                                            std::vector<DWORD>& currentPath, int currentDepth,
+                                            int& offsetsScanned, int pathsBefore,
+                                            DWORD startTick, DWORD& lastLogTick,
+                                            int logEveryOffsets, DWORD logEveryMs) {
         
         if (interruptSearch || currentDepth >= maxDepth) return 0;
         
         int pathsFound = 0;
         
-        // Optimize: Check every 16 bytes first for quick scan, then fill in gaps if needed
-        DWORD step = (currentDepth == 0) ? 16 : 4; // Larger steps for first level
+        // Use pointer alignment to avoid missing valid offsets
+        DWORD step = (currentDepth == 0) ? (DWORD)targetPointerAlignment : 4;
         
         for (DWORD offset = 0; offset <= maxOffset && !interruptSearch; offset += step) {
             DWORD_PTR checkAddr = currentAddr + offset;
@@ -1899,6 +1917,19 @@ public:
 
             if (!ReadPointerValue(checkAddr, value)) {
                 continue;
+            }
+
+            if (currentDepth == 0) {
+                offsetsScanned++;
+                DWORD now = GetTickCount();
+                if ((offsetsScanned % logEveryOffsets) == 0 || (now - lastLogTick) >= logEveryMs) {
+                    int pathsFoundSoFar = (int)pointerResults.size() - pathsBefore;
+                    std::cout << "    " << baseName << ": scanned " << offsetsScanned
+                              << "/" << (maxOffset / step)
+                              << " offsets, paths " << pathsFoundSoFar
+                              << ", elapsed " << (now - startTick) << "ms\n";
+                    lastLogTick = now;
+                }
             }
             
             // Quick validation: Is this a reasonable pointer value?
@@ -1943,7 +1974,9 @@ public:
                     
                     int subPaths = SearchPointerChainRecursiveWithOffset(value, baseName, nearbyTarget, originalTarget,
                                                                        structOffset, pointerMap, maxOffset, maxDepth,
-                                                                       newPath, currentDepth + 1);
+                                                                       newPath, currentDepth + 1,
+                                                                       offsetsScanned, pathsBefore, startTick, lastLogTick,
+                                                                       logEveryOffsets, logEveryMs);
                     pathsFound += subPaths;
                     
                     if (pathsFound >= 5) return pathsFound; // Early termination

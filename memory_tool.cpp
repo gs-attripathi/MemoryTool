@@ -1635,10 +1635,15 @@ public:
                                     threadResult.begin(), threadResult.end());
         }
         
-        // Sort by number of pointers (most promising first)
+        // Sort by closeness to target first, then by number of pointers
         std::sort(nearbyWithPointers.begin(), nearbyWithPointers.end(), 
                  [&pointerMap](const std::pair<DWORD_PTR, int>& a, const std::pair<DWORD_PTR, int>& b) {
-                     return pointerMap.at(a.first).size() > pointerMap.at(b.first).size();
+                    int distA = std::abs(a.second);
+                    int distB = std::abs(b.second);
+                    if (distA != distB) {
+                        return distA < distB; // closer offsets first
+                    }
+                    return pointerMap.at(a.first).size() > pointerMap.at(b.first).size();
                  });
         
         FinishProgress("Found " + std::to_string(nearbyWithPointers.size()) + " structure candidates");

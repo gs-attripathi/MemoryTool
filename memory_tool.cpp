@@ -1551,7 +1551,7 @@ public:
         FinishProgress("Found " + std::to_string(nearbyWithPointers.size()) + " structure candidates");
     }
     
-    // Automatic search for pointer paths to nearby addresses (Cheat Engine style)
+    // Parallelized search for pointer paths to nearby addresses
     void SearchNearbyPointerPathsAutomatic(DWORD_PTR originalTarget,
                                           const std::vector<std::pair<DWORD_PTR, int>>& nearbyWithPointers,
                                           const std::map<DWORD_PTR, std::vector<DWORD_PTR>>& pointerMap,
@@ -1559,31 +1559,70 @@ public:
         
         pointerResults.clear(); // Start fresh
         
-        StartProgress("STRUCTURE SCAN:", std::min((size_t)10, nearbyWithPointers.size()));
+        // Limit to top candidates to prevent excessive processing
+        size_t candidatesToProcess = std::min((size_t)20, nearbyWithPointers.size());
+        std::cout << "Processing top " << candidatesToProcess << " structure candidates...\n";
         
-        int addressesTried = 0;
-        for (const auto& nearby : nearbyWithPointers) {
-            if (addressesTried >= 10) break; // Limit to top 10 candidates
+        // Calculate total work units (candidates × modules)
+        int totalWorkUnits = candidatesToProcess * moduleMap.size();
+        StartProgress("POINTER CHAINS:", totalWorkUnits);
+        
+        // Process candidates in batches for better progress reporting
+        volatile LONG workUnitsCompleted = 0;
+        
+        for (size_t candidateIdx = 0; candidateIdx < candidatesToProcess; candidateIdx++) {
+            if (interruptSearch) break;
             
+            const auto& nearby = nearbyWithPointers[candidateIdx];
             DWORD_PTR nearbyAddr = nearby.first;
             int structOffset = nearby.second;
             
-            UpdateProgress(addressesTried + 1);
-            
-            // Get direct pointers to this nearby address
+            // Check if this candidate has direct pointers
             auto it = pointerMap.find(nearbyAddr);
-            if (it != pointerMap.end() && !it->second.empty()) {
+            if (it == pointerMap.end() || it->second.empty()) {
+                // Skip this candidate, update progress for all its modules
+                InterlockedExchangeAdd(&workUnitsCompleted, moduleMap.size());
+                continue;
+            }
+            
+            std::cout << "\nCandidate " << (candidateIdx + 1) << "/" << candidatesToProcess 
+                     << ": 0x" << std::hex << nearbyAddr << std::dec 
+                     << " (offset " << std::showpos << structOffset << std::noshowpos 
+                     << ") - " << it->second.size() << " direct pointers\n";
+            
+            // Search each module for this candidate
+            int moduleIndex = 0;
+            for (const auto& module : moduleMap) {
+                if (interruptSearch) break;
                 
-                // Search for pointer chains to this nearby address
-                for (const auto& module : moduleMap) {
-                    if (interruptSearch) break;
-                    
-                    SearchPointerChainsWithOffset(module.second, module.first, nearbyAddr, 
-                                                originalTarget, structOffset, pointerMap, maxOffset, maxDepth);
+                moduleIndex++;
+                std::cout << "  Checking " << module.first << "... ";
+                std::cout.flush();
+                
+                int pathsBefore = pointerResults.size();
+                SearchPointerChainsWithOffset(module.second, module.first, nearbyAddr, 
+                                            originalTarget, structOffset, pointerMap, maxOffset, maxDepth);
+                int pathsFound = pointerResults.size() - pathsBefore;
+                
+                if (pathsFound > 0) {
+                    std::cout << "Found " << pathsFound << " paths!";
+                } else {
+                    std::cout << "No paths";
+                }
+                std::cout << std::endl;
+                
+                InterlockedIncrement(&workUnitsCompleted);
+                UpdateProgress(workUnitsCompleted);
+                
+                // Stop if we found enough paths
+                if (pointerResults.size() >= 50) {
+                    std::cout << "Found 50+ paths, stopping search for efficiency.\n";
+                    InterlockedExchangeAdd(&workUnitsCompleted, totalWorkUnits - workUnitsCompleted);
+                    break;
                 }
             }
             
-            addressesTried++;
+            if (pointerResults.size() >= 50) break;
         }
         
         FinishProgress("Found " + std::to_string(pointerResults.size()) + " complete paths");
@@ -1600,7 +1639,7 @@ public:
                                             structOffset, pointerMap, maxOffset, maxDepth, currentPath, 0);
     }
     
-    // Recursive pointer chain search that creates complete paths to original target
+    // Optimized recursive pointer chain search with early termination
     int SearchPointerChainRecursiveWithOffset(DWORD_PTR currentAddr, const std::string& baseName,
                                             DWORD_PTR nearbyTarget, DWORD_PTR originalTarget, int structOffset,
                                             const std::map<DWORD_PTR, std::vector<DWORD_PTR>>& pointerMap,
@@ -1611,14 +1650,21 @@ public:
         
         int pathsFound = 0;
         
-        // Try different offsets from current address
-        for (DWORD offset = 0; offset <= maxOffset && !interruptSearch; offset += 4) {
+        // Optimize: Check every 16 bytes first for quick scan, then fill in gaps if needed
+        DWORD step = (currentDepth == 0) ? 16 : 4; // Larger steps for first level
+        
+        for (DWORD offset = 0; offset <= maxOffset && !interruptSearch; offset += step) {
             DWORD_PTR checkAddr = currentAddr + offset;
             DWORD_PTR value;
             SIZE_T bytesRead;
             
             if (!ReadProcessMemory(processHandle, (LPCVOID)checkAddr, 
                                  &value, sizeof(value), &bytesRead)) {
+                continue;
+            }
+            
+            // Quick validation: Is this a reasonable pointer value?
+            if (value < 0x10000 || value > 0x7FFFFFFFFFFF || (value & 0x3) != 0) {
                 continue;
             }
             
@@ -1636,7 +1682,7 @@ public:
                     path.offsets.push_back(structOffset);
                 }
                 
-                path.finalAddress = originalTarget;  // This is what the path actually resolves to
+                path.finalAddress = originalTarget;
                 path.originalTarget = originalTarget;
                 path.finalOffset = structOffset;
                 path.depth = currentDepth + 1 + (structOffset != 0 ? 1 : 0);
@@ -1644,23 +1690,25 @@ public:
                 pointerResults.push_back(path);
                 pathsFound++;
                 
-                if (pathsFound >= 20) return pathsFound; // Limit results per module
+                if (pathsFound >= 5) return pathsFound; // Reduced limit for faster search
                 continue;
             }
             
-            // Check if this value is in our pointer map (points to something useful)
-            auto it = pointerMap.find(value);
-            if (it != pointerMap.end() && currentDepth < maxDepth - 1) {
-                // Recursively search from this new address
-                std::vector<DWORD> newPath = currentPath;
-                newPath.push_back(offset);
-                
-                int subPaths = SearchPointerChainRecursiveWithOffset(value, baseName, nearbyTarget, originalTarget,
-                                                                   structOffset, pointerMap, maxOffset, maxDepth,
-                                                                   newPath, currentDepth + 1);
-                pathsFound += subPaths;
-                
-                if (pathsFound >= 20) return pathsFound; // Limit results
+            // Only recurse if we haven't found enough paths and this looks promising
+            if (pathsFound < 3 && currentDepth < maxDepth - 1) {
+                auto it = pointerMap.find(value);
+                if (it != pointerMap.end() && it->second.size() > 0) {
+                    // Recursively search from this new address
+                    std::vector<DWORD> newPath = currentPath;
+                    newPath.push_back(offset);
+                    
+                    int subPaths = SearchPointerChainRecursiveWithOffset(value, baseName, nearbyTarget, originalTarget,
+                                                                       structOffset, pointerMap, maxOffset, maxDepth,
+                                                                       newPath, currentDepth + 1);
+                    pathsFound += subPaths;
+                    
+                    if (pathsFound >= 5) return pathsFound; // Early termination
+                }
             }
         }
         

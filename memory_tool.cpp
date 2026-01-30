@@ -256,12 +256,23 @@ public:
                 
                 for (SIZE_T i = 0; i <= bytesRead - searchBytes.size(); i++) {
                     if (memcmp(buffer.data() + i, searchBytes.data(), searchBytes.size()) == 0) {
-                        MemoryResult result;
-                        result.address = baseAddr + offset + i;
-                        result.value = searchBytes;
-                        result.type = type;
-                        result.size = searchBytes.size();
-                        searchResults.push_back(result);
+                        DWORD_PTR foundAddr = baseAddr + offset + i;
+                        
+                        // Validate that this address is in writable memory
+                        MEMORY_BASIC_INFORMATION mbi;
+                        if (VirtualQueryEx(processHandle, (LPCVOID)foundAddr, &mbi, sizeof(mbi))) {
+                            // Only include addresses in committed, writable memory
+                            if (mbi.State == MEM_COMMIT && 
+                                (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY))) {
+                                
+                                MemoryResult result;
+                                result.address = foundAddr;
+                                result.value = searchBytes;
+                                result.type = type;
+                                result.size = searchBytes.size();
+                                searchResults.push_back(result);
+                            }
+                        }
                     }
                 }
             }
@@ -359,6 +370,25 @@ public:
             DWORD_PTR address = searchResults[idx].address;
             SIZE_T size = newBytes.size();
             
+            // First, validate the memory region
+            MEMORY_BASIC_INFORMATION mbi;
+            if (VirtualQueryEx(processHandle, (LPCVOID)address, &mbi, sizeof(mbi)) == 0) {
+                if (idx < 5) {
+                    std::cout << "Address 0x" << std::hex << address << std::dec 
+                             << " - Invalid memory region (unmapped)\n";
+                }
+                continue;
+            }
+            
+            // Check if memory is committed and accessible
+            if (mbi.State != MEM_COMMIT) {
+                if (idx < 5) {
+                    std::cout << "Address 0x" << std::hex << address << std::dec 
+                             << " - Memory not committed\n";
+                }
+                continue;
+            }
+            
             // Try to change memory protection to allow writing
             DWORD oldProtect;
             bool protectionChanged = VirtualProtectEx(processHandle, (LPVOID)address, 
@@ -383,6 +413,9 @@ public:
                             break;
                         case ERROR_PARTIAL_COPY:
                             std::cout << " (Memory Protection - Read-only region)";
+                            break;
+                        case 998: // ERROR_INVALID_ACCESS_TO_MEMORY_LOCATION
+                            std::cout << " (Invalid Memory Location - Address may be unmapped or protected)";
                             break;
                         default:
                             std::cout << " (Unknown error)";

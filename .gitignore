@@ -1,0 +1,65 @@
+# Build directories
+build/
+bin/
+obj/
+
+# Compiled executables
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Visual Studio files
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+*.suo
+*.user
+*.aps
+*.pch
+*.vspscc
+*_i.c
+*_p.c
+*.ncb
+*.tlb
+*.tlh
+*.bak
+*.cache
+*.ilk
+*.log
+*.lib
+*.sbr
+*.pdb
+*.idb
+*.res
+*.manifest
+
+# MinGW/GCC files
+*.o
+*.a
+
+# CMake files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.cmake
+
+# IDE files
+.vscode/
+.vs/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Pointer scan result files
+pointer_scan_*.txt

@@ -12,10 +12,6 @@
 #include <set>
 #include <conio.h>
 #include <cmath>
-#include <thread>
-#include <mutex>
-#include <atomic>
-#include <future>
 
 #pragma comment(lib, "psapi.lib")
 
@@ -47,6 +43,18 @@ struct PointerPath {
     int depth;
 };
 
+// Thread data structure for Windows native threading
+struct ThreadData {
+    class MemoryTool* memoryTool;
+    std::map<DWORD_PTR, std::vector<DWORD_PTR>>* pointerMap;
+    const std::vector<std::pair<DWORD_PTR, SIZE_T>>* regions;
+    size_t startIdx;
+    size_t endIdx;
+};
+
+// Forward declaration for thread procedure
+DWORD WINAPI ScanRegionsThreadProc(LPVOID lpParam);
+
 class MemoryTool {
 private:
     HANDLE processHandle;
@@ -62,18 +70,25 @@ private:
     int currentProgress;
     int totalProgress;
     
-    // Thread-safe pointer map building
-    std::mutex pointerMapMutex;
-    std::atomic<int> regionsProcessed;
-    std::atomic<int> totalPointersFound;
+    // Windows native threading for MinGW compatibility
+    CRITICAL_SECTION pointerMapCriticalSection;
+    volatile LONG regionsProcessed;
+    volatile LONG totalPointersFound;
+    bool criticalSectionInitialized;
 
 public:
     MemoryTool() : processHandle(NULL), processId(0), interruptSearch(false), 
-                   regionsProcessed(0), totalPointersFound(0) {}
+                   regionsProcessed(0), totalPointersFound(0), criticalSectionInitialized(false) {
+        InitializeCriticalSection(&pointerMapCriticalSection);
+        criticalSectionInitialized = true;
+    }
     
     ~MemoryTool() {
         if (processHandle) {
             CloseHandle(processHandle);
+        }
+        if (criticalSectionInitialized) {
+            DeleteCriticalSection(&pointerMapCriticalSection);
         }
     }
 
@@ -1101,7 +1116,7 @@ public:
         FinishProgress("Found " + std::to_string(pointerResults.size()) + " pointer paths");
     }
 
-    // Fast parallelized pointer map building (Cheat Engine style)
+    // Fast parallelized pointer map building (Windows native threading for MinGW compatibility)
     void BuildPointerMap(std::map<DWORD_PTR, std::vector<DWORD_PTR>>& pointerMap) {
         // Collect all scannable memory regions first
         std::vector<std::pair<DWORD_PTR, SIZE_T>> regions;
@@ -1115,41 +1130,54 @@ public:
         std::cout << "Found " << regions.size() << " scannable regions. Building pointer map...\n";
         StartProgress("POINTER MAP:", regions.size());
         
-        // Reset atomic counters
+        // Reset counters
         regionsProcessed = 0;
         totalPointersFound = 0;
         
-        // Determine optimal thread count (don't exceed CPU cores)
-        unsigned int threadCount = std::min(std::thread::hardware_concurrency(), 8u);
+        // Determine optimal thread count
+        SYSTEM_INFO sysInfo;
+        GetSystemInfo(&sysInfo);
+        DWORD threadCount = min(sysInfo.dwNumberOfProcessors, 8);
         if (threadCount == 0) threadCount = 4; // Fallback
         
         std::cout << "Using " << threadCount << " threads for scanning.\n";
         
+        // Create thread data structures
+        std::vector<ThreadData> threadDataArray(threadCount);
+        std::vector<HANDLE> threadHandles(threadCount);
+        
         // Divide regions among threads
-        std::vector<std::future<void>> futures;
         size_t regionsPerThread = regions.size() / threadCount;
         
-        for (unsigned int i = 0; i < threadCount; i++) {
+        for (DWORD i = 0; i < threadCount; i++) {
             size_t startIdx = i * regionsPerThread;
             size_t endIdx = (i == threadCount - 1) ? regions.size() : (i + 1) * regionsPerThread;
             
-            futures.push_back(std::async(std::launch::async, [this, &pointerMap, &regions, startIdx, endIdx]() {
-                ScanRegionsThreaded(pointerMap, regions, startIdx, endIdx);
-            }));
+            threadDataArray[i].memoryTool = this;
+            threadDataArray[i].pointerMap = &pointerMap;
+            threadDataArray[i].regions = &regions;
+            threadDataArray[i].startIdx = startIdx;
+            threadDataArray[i].endIdx = endIdx;
+            
+            threadHandles[i] = CreateThread(NULL, 0, ScanRegionsThreadProc, 
+                                          &threadDataArray[i], 0, NULL);
         }
         
         // Monitor progress while threads work
-        while (regionsProcessed < (int)regions.size() && !interruptSearch) {
+        while (regionsProcessed < (LONG)regions.size() && !interruptSearch) {
             UpdateProgress(regionsProcessed);
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            Sleep(100); // Windows Sleep instead of std::this_thread
         }
         
         // Wait for all threads to complete
-        for (auto& future : futures) {
-            future.wait();
+        WaitForMultipleObjects(threadCount, threadHandles.data(), TRUE, INFINITE);
+        
+        // Clean up thread handles
+        for (HANDLE handle : threadHandles) {
+            CloseHandle(handle);
         }
         
-        FinishProgress("Found " + std::to_string(totalPointersFound.load()) + " pointers");
+        FinishProgress("Found " + std::to_string(totalPointersFound) + " pointers");
     }
     
     // Collect all memory regions suitable for pointer scanning
@@ -1179,7 +1207,7 @@ public:
         }
     }
     
-    // Thread worker function for scanning regions
+    // Thread worker function for scanning regions (Windows native)
     void ScanRegionsThreaded(std::map<DWORD_PTR, std::vector<DWORD_PTR>>& pointerMap,
                            const std::vector<std::pair<DWORD_PTR, SIZE_T>>& regions,
                            size_t startIdx, size_t endIdx) {
@@ -1192,17 +1220,18 @@ public:
             SIZE_T size = regions[i].second;
             
             int regionPointers = ScanRegionForPointersOptimized(baseAddr, size, localMap);
-            totalPointersFound += regionPointers;
-            regionsProcessed++;
+            InterlockedAdd(&totalPointersFound, regionPointers);
+            InterlockedIncrement(&regionsProcessed);
         }
         
-        // Merge local map into global map (thread-safe)
+        // Merge local map into global map (thread-safe with critical section)
         if (!localMap.empty()) {
-            std::lock_guard<std::mutex> lock(pointerMapMutex);
+            EnterCriticalSection(&pointerMapCriticalSection);
             for (const auto& entry : localMap) {
                 auto& globalList = pointerMap[entry.first];
                 globalList.insert(globalList.end(), entry.second.begin(), entry.second.end());
             }
+            LeaveCriticalSection(&pointerMapCriticalSection);
         }
     }
 
@@ -1561,6 +1590,20 @@ public:
         SearchValue(value, type);
     }
 };
+
+// Windows thread procedure for pointer scanning
+DWORD WINAPI ScanRegionsThreadProc(LPVOID lpParam) {
+    ThreadData* data = static_cast<ThreadData*>(lpParam);
+    
+    try {
+        data->memoryTool->ScanRegionsThreaded(*data->pointerMap, *data->regions, 
+                                            data->startIdx, data->endIdx);
+    } catch (...) {
+        // Handle any exceptions in thread
+    }
+    
+    return 0;
+}
 
 int main() {
     try {

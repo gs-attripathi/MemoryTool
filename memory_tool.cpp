@@ -8,8 +8,6 @@
 #include <fstream>
 #include <iomanip>
 #include <algorithm>
-#include <thread>
-#include <chrono>
 #include <map>
 #include <set>
 #include <conio.h>
@@ -250,7 +248,7 @@ public:
         std::vector<BYTE> buffer(CHUNK_SIZE);
         
         for (SIZE_T offset = 0; offset < size; offset += CHUNK_SIZE) {
-            SIZE_T readSize = min(CHUNK_SIZE, size - offset);
+            SIZE_T readSize = std::min(CHUNK_SIZE, size - offset);
             SIZE_T bytesRead;
             
             if (ReadProcessMemory(processHandle, (LPCVOID)(baseAddr + offset), 
@@ -281,7 +279,7 @@ public:
         std::cout << "Index | Address          | Value\n";
         std::cout << "------|------------------|------------------\n";
         
-        for (size_t i = 0; i < min(searchResults.size(), (size_t)50); i++) {
+        for (size_t i = 0; i < std::min(searchResults.size(), (size_t)50); i++) {
             std::cout << std::setw(5) << i << " | 0x" 
                      << std::hex << std::setw(16) << std::setfill('0') 
                      << searchResults[i].address << std::dec << " | ";
@@ -420,26 +418,9 @@ public:
         pointerResults.clear();
         interruptSearch = false;
         
-        // Start pointer search in separate thread
-        std::thread searchThread([this, targetAddr, maxOffset, maxDepth]() {
-            PerformPointerSearch(targetAddr, maxOffset, maxDepth);
-        });
-        
-        // Monitor for interrupt
-        std::cout << "Press 'q' to interrupt search...\n";
-        while (searchThread.joinable()) {
-            if (_kbhit()) {
-                char ch = _getch();
-                if (ch == 'q' || ch == 'Q') {
-                    interruptSearch = true;
-                    std::cout << "Interrupting search...\n";
-                    break;
-                }
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-        
-        searchThread.join();
+        // Perform pointer search (simplified without threading for compatibility)
+        std::cout << "Press Ctrl+C to interrupt search if needed...\n";
+        PerformPointerSearch(targetAddr, maxOffset, maxDepth);
         
         std::cout << "Pointer search complete. Found " << pointerResults.size() << " pointer paths.\n";
         DisplayPointerResults();
@@ -489,7 +470,7 @@ public:
         std::vector<BYTE> buffer(CHUNK_SIZE);
         
         for (SIZE_T offset = 0; offset < size && !interruptSearch; offset += CHUNK_SIZE) {
-            SIZE_T readSize = min(CHUNK_SIZE, size - offset);
+            SIZE_T readSize = std::min(CHUNK_SIZE, size - offset);
             SIZE_T bytesRead;
             
             if (ReadProcessMemory(processHandle, (LPCVOID)(baseAddr + offset), 
@@ -583,7 +564,7 @@ public:
         std::cout << "Index | Pointer Path | Final Address\n";
         std::cout << "------|--------------|---------------\n";
         
-        for (size_t i = 0; i < min(pointerResults.size(), (size_t)20); i++) {
+        for (size_t i = 0; i < std::min(pointerResults.size(), (size_t)20); i++) {
             const auto& path = pointerResults[i];
             std::cout << std::setw(5) << i << " | ";
             

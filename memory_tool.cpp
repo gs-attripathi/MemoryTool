@@ -1628,17 +1628,20 @@ public:
                         const auto& path = pointerResults[i];
                         std::cout << "    " << (i + 1) << ": [[" << path.baseName << "+0x" << std::hex << path.offsets[0] << "]";
                         for (size_t j = 1; j < path.offsets.size(); j++) {
-                            if (j == path.offsets.size() - 1 && path.finalOffset != 0) {
-                                if (path.offsets[j] >= 0) {
-                                    std::cout << "+0x" << path.offsets[j];
-                                } else {
-                                    std::cout << "-0x" << (-path.offsets[j]);
-                                }
+                            std::cout << "+0x" << path.offsets[j];
+                        }
+                        std::cout << "]";
+                        
+                        // Add structure offset separately
+                        if (path.finalOffset != 0) {
+                            if (path.finalOffset > 0) {
+                                std::cout << "+0x" << path.finalOffset;
                             } else {
-                                std::cout << "+0x" << path.offsets[j];
+                                std::cout << "-0x" << (-path.finalOffset);
                             }
                         }
-                        std::cout << "] = 0x" << path.finalAddress << std::dec << std::endl;
+                        
+                        std::cout << " = 0x" << path.finalAddress << std::dec << std::endl;
                     }
                     std::cout << std::endl;
                 } else {
@@ -1684,17 +1687,20 @@ public:
             const auto& path = pointerResults[i];
             std::cout << std::setw(5) << i << " | [[" << path.baseName << "+0x" << std::hex << path.offsets[0] << "]";
             for (size_t j = 1; j < path.offsets.size(); j++) {
-                if (j == path.offsets.size() - 1 && path.finalOffset != 0) {
-                    if (path.offsets[j] >= 0) {
-                        std::cout << "+0x" << path.offsets[j];
-                    } else {
-                        std::cout << "-0x" << (-path.offsets[j]);
-                    }
+                std::cout << "+0x" << path.offsets[j];
+            }
+            std::cout << "]";
+            
+            // Add structure offset separately
+            if (path.finalOffset != 0) {
+                if (path.finalOffset > 0) {
+                    std::cout << "+0x" << path.finalOffset;
                 } else {
-                    std::cout << "+0x" << path.offsets[j];
+                    std::cout << "-0x" << (-path.finalOffset);
                 }
             }
-            std::cout << "] = 0x" << path.finalAddress << std::dec << "\n";
+            
+            std::cout << " = 0x" << path.finalAddress << std::dec << "\n";
         }
         std::cout << std::endl;
     }
@@ -1748,18 +1754,19 @@ public:
                 path.offsets = currentPath;
                 path.offsets.push_back(offset);
                 
-                // Add the structure offset as the final offset
-                if (structOffset != 0) {
-                    path.offsets.push_back(structOffset);
-                }
+                // DON'T add structure offset as an offset - it's handled in final address calculation
+                // The path points to nearbyTarget, finalAddress is calculated as nearbyTarget + structOffset
                 
                 path.finalAddress = originalTarget;
                 path.originalTarget = originalTarget;
                 path.finalOffset = structOffset;
-                path.depth = currentDepth + 1 + (structOffset != 0 ? 1 : 0);
+                path.depth = currentDepth + 1; // Correct depth - don't add extra for structure offset
                 
-                pointerResults.push_back(path);
-                pathsFound++;
+                // Validate this is a reasonable pointer path before adding
+                if (IsReasonablePointerPath(path)) {
+                    pointerResults.push_back(path);
+                    pathsFound++;
+                }
                 
                 if (pathsFound >= 5) return pathsFound; // Reduced limit for faster search
                 continue;
@@ -1795,6 +1802,51 @@ public:
         
         // Cheat Engine optimization: Skip expensive VirtualQueryEx for speed
         // We'll validate these during pointer chain building instead
+        return true;
+    }
+    
+    // Validate if a pointer path is reasonable (filter out false positives)
+    bool IsReasonablePointerPath(const PointerPath& path) {
+        // Filter out system DLLs - games rarely have pointers from system libraries
+        std::string baseLower = path.baseName;
+        std::transform(baseLower.begin(), baseLower.end(), baseLower.begin(), ::tolower);
+        
+        std::vector<std::string> systemDlls = {
+            "advapi32.dll", "kernel32.dll", "ntdll.dll", "user32.dll", 
+            "gdi32.dll", "audioses.dll", "winmm.dll", "ole32.dll",
+            "shell32.dll", "comctl32.dll", "msvcrt.dll", "ucrtbase.dll"
+        };
+        
+        for (const auto& sysDll : systemDlls) {
+            if (baseLower.find(sysDll) != std::string::npos) {
+                return false; // Skip system DLL pointers
+            }
+        }
+        
+        // Filter out excessively deep pointer chains (>6 levels is suspicious)
+        if (path.depth > 6) {
+            return false;
+        }
+        
+        // Filter out paths with extremely large structure offsets
+        if (abs(path.finalOffset) > 8192) { // 8KB structure offset limit
+            return false;
+        }
+        
+        // Filter out paths where all offsets are identical (suspicious pattern)
+        if (path.offsets.size() > 2) {
+            bool allSame = true;
+            for (size_t i = 1; i < path.offsets.size(); i++) {
+                if (path.offsets[i] != path.offsets[0]) {
+                    allSame = false;
+                    break;
+                }
+            }
+            if (allSame) {
+                return false; // Suspicious identical offset pattern
+            }
+        }
+        
         return true;
     }
     
@@ -1925,18 +1977,20 @@ public:
             // Format complete pointer path exactly like Cheat Engine
             std::cout << "[[" << path.baseName << "+0x" << std::hex << path.offsets[0] << "]";
             for (size_t j = 1; j < path.offsets.size(); j++) {
-                if (j == path.offsets.size() - 1 && path.finalOffset != 0) {
-                    // Last offset - show with proper sign
-                    if (path.offsets[j] >= 0) {
-                        std::cout << "+0x" << path.offsets[j];
-                    } else {
-                        std::cout << "-0x" << (-path.offsets[j]);
-                    }
+                std::cout << "+0x" << path.offsets[j];
+            }
+            std::cout << "]";
+            
+            // Add structure offset separately if needed
+            if (path.finalOffset != 0) {
+                if (path.finalOffset > 0) {
+                    std::cout << "+0x" << std::hex << path.finalOffset << std::dec;
                 } else {
-                    std::cout << "+0x" << path.offsets[j];
+                    std::cout << "-0x" << std::hex << (-path.finalOffset) << std::dec;
                 }
             }
-            std::cout << "] = 0x" << path.finalAddress << std::dec << "\n";
+            
+            std::cout << " = 0x" << std::hex << path.finalAddress << std::dec << "\n";
         }
         
         if (pointerResults.size() > 50) {

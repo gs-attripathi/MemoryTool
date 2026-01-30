@@ -1123,6 +1123,25 @@ public:
             std::cout << "2. Target address has changed since you found it\n";
             std::cout << "3. Target is pointed to by calculated addresses (not static pointers)\n";
             std::cout << "4. Target is in a memory region we filtered out\n";
+            
+            // Check if we should try nearby addresses that have pointers
+            std::vector<std::pair<DWORD_PTR, int>> nearbyWithPointers;
+            FindNearbyAddressesWithPointers(targetAddr, pointerMap, nearbyWithPointers);
+            
+            if (!nearbyWithPointers.empty()) {
+                std::cout << "\nWould you like to search for pointer paths to nearby addresses?\n";
+                std::cout << "This often works when your target is part of a larger structure.\n";
+                std::cout << "Enter 'y' to try nearby addresses, or any other key to exit: ";
+                
+                char choice;
+                std::cin >> choice;
+                
+                if (choice == 'y' || choice == 'Y') {
+                    SearchNearbyPointerPaths(targetAddr, nearbyWithPointers, pointerMap, maxOffset, maxDepth);
+                    return;
+                }
+            }
+            
             std::cout << "\nTry: Find the value again and immediately search for pointers.\n";
             return;
         }
@@ -1437,6 +1456,108 @@ public:
         
         if (foundNearby == 0) {
             std::cout << "  No pointers found to nearby addresses either.\n";
+        }
+    }
+    
+    // Find nearby addresses that have pointers for structure-based searching
+    void FindNearbyAddressesWithPointers(DWORD_PTR targetAddr, 
+                                       const std::map<DWORD_PTR, std::vector<DWORD_PTR>>& pointerMap,
+                                       std::vector<std::pair<DWORD_PTR, int>>& nearbyWithPointers) {
+        
+        // Check a wider range for structure analysis
+        for (int offset = -256; offset <= 256; offset += 4) {
+            if (offset == 0) continue; // Skip the target itself
+            
+            DWORD_PTR checkAddr = targetAddr + offset;
+            auto it = pointerMap.find(checkAddr);
+            if (it != pointerMap.end() && !it->second.empty()) {
+                nearbyWithPointers.push_back({checkAddr, offset});
+            }
+        }
+        
+        // Sort by number of pointers (most promising first)
+        std::sort(nearbyWithPointers.begin(), nearbyWithPointers.end(), 
+                 [&pointerMap](const std::pair<DWORD_PTR, int>& a, const std::pair<DWORD_PTR, int>& b) {
+                     return pointerMap.at(a.first).size() > pointerMap.at(b.first).size();
+                 });
+    }
+    
+    // Search for pointer paths to nearby addresses
+    void SearchNearbyPointerPaths(DWORD_PTR originalTarget,
+                                const std::vector<std::pair<DWORD_PTR, int>>& nearbyWithPointers,
+                                const std::map<DWORD_PTR, std::vector<DWORD_PTR>>& pointerMap,
+                                DWORD maxOffset, int maxDepth) {
+        
+        std::cout << "\nSearching pointer paths to nearby addresses...\n";
+        
+        int totalPathsFound = 0;
+        int addressesTried = 0;
+        
+        for (const auto& nearby : nearbyWithPointers) {
+            if (addressesTried >= 5) break; // Limit to top 5 candidates
+            
+            DWORD_PTR nearbyAddr = nearby.first;
+            int offset = nearby.second;
+            
+            std::cout << "\nTrying address 0x" << std::hex << nearbyAddr << std::dec 
+                     << " (original" << std::showpos << offset << std::noshowpos << ")...\n";
+            
+            // Clear previous results and search this address
+            pointerResults.clear();
+            
+            // Get direct pointers to this nearby address
+            std::vector<DWORD_PTR> level0Pointers;
+            auto it = pointerMap.find(nearbyAddr);
+            if (it != pointerMap.end()) {
+                level0Pointers = it->second;
+            }
+            
+            std::cout << "Found " << level0Pointers.size() << " direct pointers to this address.\n";
+            
+            if (!level0Pointers.empty()) {
+                // Search for pointer chains to this nearby address
+                StartProgress("POINTER CHAINS:", moduleMap.size());
+                
+                int moduleIndex = 0;
+                for (const auto& module : moduleMap) {
+                    if (interruptSearch) break;
+                    
+                    moduleIndex++;
+                    UpdateProgress(moduleIndex);
+                    
+                    SearchPointerChains(module.second, module.first, nearbyAddr, 
+                                      pointerMap, maxOffset, maxDepth);
+                }
+                
+                FinishProgress("Found " + std::to_string(pointerResults.size()) + " pointer paths");
+                
+                if (!pointerResults.empty()) {
+                    std::cout << "\nPointer paths to nearby address (add " << std::showpos << offset << std::noshowpos << " to reach original target):\n";
+                    DisplayPointerResults();
+                    
+                    // Modify the displayed results to show the final calculation
+                    std::cout << "\nTo reach your original target (0x" << std::hex << originalTarget << std::dec << "):\n";
+                    std::cout << "Use these pointer paths and add " << std::showpos << offset << std::noshowpos << " to the final result.\n";
+                    std::cout << "Example: If path gives you 0x" << std::hex << nearbyAddr << std::dec 
+                             << ", then 0x" << std::hex << nearbyAddr << std::dec << std::showpos << offset << std::noshowpos 
+                             << " = 0x" << std::hex << originalTarget << std::dec << "\n";
+                    
+                    totalPathsFound += pointerResults.size();
+                    
+                    if (!pointerResults.empty()) {
+                        SavePointerResults();
+                    }
+                }
+            }
+            
+            addressesTried++;
+        }
+        
+        if (totalPathsFound == 0) {
+            std::cout << "\nNo pointer paths found to nearby addresses either.\n";
+            std::cout << "This target might be in dynamically allocated memory (heap/stack).\n";
+        } else {
+            std::cout << "\nTotal paths found: " << totalPathsFound << "\n";
         }
     }
     

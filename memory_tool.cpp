@@ -52,6 +52,11 @@ private:
     std::vector<PointerPath> pointerResults;
     std::map<std::string, DWORD_PTR> moduleMap;
     bool interruptSearch;
+    
+    // Progress tracking for in-place logging
+    std::string currentScanType;
+    int currentProgress;
+    int totalProgress;
 
 public:
     MemoryTool() : processHandle(NULL), processId(0), interruptSearch(false) {}
@@ -311,11 +316,26 @@ public:
         if (type == TYPE_FLOAT || type == TYPE_DOUBLE) {
             std::cout << " (with fuzzy matching - will find similar decimal values)";
         }
-        std::cout << " in process memory...\n";
+        std::cout << std::endl;
         
+        // First pass: count total regions
         MEMORY_BASIC_INFORMATION mbi;
         DWORD_PTR address = 0;
+        int totalRegions = 0;
         
+        while (VirtualQueryEx(processHandle, (LPCVOID)address, &mbi, sizeof(mbi))) {
+            if (mbi.State == MEM_COMMIT && 
+                (mbi.Protect & PAGE_GUARD) == 0 && 
+                (mbi.Protect & PAGE_NOACCESS) == 0) {
+                totalRegions++;
+            }
+            address = (DWORD_PTR)mbi.BaseAddress + mbi.RegionSize;
+        }
+        
+        // Second pass: actual search with progress
+        StartProgress("VALUE SCAN:", totalRegions);
+        
+        address = 0;
         int regionCount = 0;
         int searchableRegions = 0;
         
@@ -328,13 +348,13 @@ public:
                 
                 searchableRegions++;
                 SearchInRegion((DWORD_PTR)mbi.BaseAddress, mbi.RegionSize, searchBytes, type);
+                UpdateProgress(searchableRegions);
             }
             
             address = (DWORD_PTR)mbi.BaseAddress + mbi.RegionSize;
         }
         
-        std::cout << "Scanned " << regionCount << " memory regions (" 
-                 << searchableRegions << " searchable)\n";
+        FinishProgress("Found " + std::to_string(searchResults.size()) + " results");
         
         std::cout << "Search complete. Found " << searchResults.size() << " results.\n";
         DisplayResults();
@@ -589,6 +609,52 @@ public:
         return indices;
     }
 
+    // In-place progress display functions
+    void StartProgress(const std::string& scanType, int total = 100) {
+        currentScanType = scanType;
+        currentProgress = 0;
+        totalProgress = total;
+        UpdateProgress(0);
+    }
+    
+    void UpdateProgress(int progress) {
+        currentProgress = progress;
+        
+        // Calculate percentage
+        int percentage = (totalProgress > 0) ? (currentProgress * 100) / totalProgress : 0;
+        percentage = std::min(100, percentage);
+        
+        // Create progress bar
+        const int barWidth = 30;
+        int filledWidth = (percentage * barWidth) / 100;
+        
+        std::string progressBar = "[";
+        for (int i = 0; i < barWidth; i++) {
+            if (i < filledWidth) {
+                progressBar += "=";
+            } else if (i == filledWidth && percentage < 100) {
+                progressBar += ">";
+            } else {
+                progressBar += " ";
+            }
+        }
+        progressBar += "]";
+        
+        // Print in-place (carriage return without newline)
+        std::cout << "\r" << currentScanType << " " << progressBar 
+                 << " " << percentage << "% (" << currentProgress;
+        if (totalProgress > 0) {
+            std::cout << "/" << totalProgress;
+        }
+        std::cout << ")";
+        std::cout.flush();
+    }
+    
+    void FinishProgress(const std::string& result = "") {
+        UpdateProgress(totalProgress); // Show 100%
+        std::cout << " - " << result << std::endl; // New line to finish
+    }
+
     // Filter current search results
     void FilterResults() {
         if (searchResults.empty()) {
@@ -655,7 +721,15 @@ public:
         
         std::vector<MemoryResult> filteredResults;
         
-        for (auto& result : searchResults) {
+        StartProgress("FILTERING:", searchResults.size());
+        
+        for (size_t i = 0; i < searchResults.size(); i++) {
+            auto& result = searchResults[i];
+            
+            // Update progress every 100 results
+            if (i % 100 == 0) {
+                UpdateProgress(i);
+            }
             // Read current value from memory
             std::vector<BYTE> currentValue(result.size);
             SIZE_T bytesRead;
@@ -1001,51 +1075,64 @@ public:
         
         // Step 3: Recursively build pointer chains
         std::cout << "Step 3: Building pointer chains...\n";
+        StartProgress("POINTER CHAINS:", moduleMap.size());
+        
+        int moduleIndex = 0;
         for (const auto& module : moduleMap) {
             if (interruptSearch) break;
             
-            std::cout << "Scanning module: " << module.first << " (0x" 
-                     << std::hex << module.second << std::dec << ")\n";
+            moduleIndex++;
+            UpdateProgress(moduleIndex);
             
             SearchPointerChains(module.second, module.first, targetAddr, 
                               pointerMap, maxOffset, maxDepth);
         }
         
-        std::cout << "\nPointer search completed.\n";
+        FinishProgress("Found " + std::to_string(pointerResults.size()) + " pointer paths");
     }
 
     // Build comprehensive pointer map of entire process memory
     void BuildPointerMap(std::map<DWORD_PTR, std::vector<DWORD_PTR>>& pointerMap) {
+        // First pass: count total regions
         MEMORY_BASIC_INFORMATION mbi;
         DWORD_PTR address = 0;
+        int totalRegions = 0;
+        
+        while (VirtualQueryEx(processHandle, (LPCVOID)address, &mbi, sizeof(mbi))) {
+            if (mbi.State == MEM_COMMIT && 
+                (mbi.Protect & PAGE_GUARD) == 0 && 
+                (mbi.Protect & PAGE_NOACCESS) == 0 &&
+                (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
+                totalRegions++;
+            }
+            address = (DWORD_PTR)mbi.BaseAddress + mbi.RegionSize;
+        }
+        
+        // Second pass: build pointer map with progress
+        StartProgress("POINTER MAP:", totalRegions);
+        
+        address = 0;
         int regionsScanned = 0;
         int totalPointers = 0;
         
         while (VirtualQueryEx(processHandle, (LPCVOID)address, &mbi, sizeof(mbi)) && !interruptSearch) {
-            regionsScanned++;
-            
             // Only scan committed, readable memory
             if (mbi.State == MEM_COMMIT && 
                 (mbi.Protect & PAGE_GUARD) == 0 && 
                 (mbi.Protect & PAGE_NOACCESS) == 0 &&
                 (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
                 
+                regionsScanned++;
                 int regionPointers = ScanRegionForPointers((DWORD_PTR)mbi.BaseAddress, 
                                                          mbi.RegionSize, pointerMap);
                 totalPointers += regionPointers;
+                UpdateProgress(regionsScanned);
             }
             
             address = (DWORD_PTR)mbi.BaseAddress + mbi.RegionSize;
-            
-            // Show progress every 50 regions
-            if (regionsScanned % 50 == 0) {
-                std::cout << "Scanned " << regionsScanned << " regions, found " 
-                         << totalPointers << " total pointers...\n";
-            }
         }
         
-        std::cout << "Pointer map complete: " << regionsScanned << " regions, " 
-                 << totalPointers << " pointers.\n";
+        FinishProgress("Found " + std::to_string(totalPointers) + " pointers");
     }
 
     // Scan memory region for all pointers (Cheat Engine approach)
@@ -1111,17 +1198,15 @@ public:
         
         std::vector<DWORD> currentPath;
         int pathsFound = 0;
+        int initialPathCount = pointerResults.size();
         
         // Start recursive search from this module base
         pathsFound = SearchPointerChainRecursive(baseAddr, baseName, targetAddr, 
                                                 pointerMap, maxOffset, maxDepth, 
                                                 currentPath, 0);
         
-        if (pathsFound > 0) {
-            std::cout << "Found " << pathsFound << " pointer paths in " << baseName << "\n";
-        } else {
-            std::cout << "No pointer paths found in " << baseName << "\n";
-        }
+        // Update the current scan type to show module progress
+        currentScanType = "SCANNING " + baseName + ":";
     }
     
     // Recursive pointer chain search

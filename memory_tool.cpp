@@ -1088,18 +1088,46 @@ public:
         
         // Step 2: Find all addresses that contain our target
         std::cout << "Step 2: Finding direct references to target...\n";
+        
+        // First, validate that the target address is actually readable
+        std::cout << "Validating target address 0x" << std::hex << targetAddr << std::dec << "...\n";
+        if (!ValidateTargetAddress(targetAddr)) {
+            std::cout << "ERROR: Target address is not readable or has changed!\n";
+            std::cout << "Make sure the target process hasn't modified this memory.\n";
+            return;
+        }
+        std::cout << "Target address is valid and readable.\n";
+        
+        // Check if target is in our scanned regions
+        if (!IsAddressInScannedRegions(targetAddr)) {
+            std::cout << "WARNING: Target address is not in scanned memory regions.\n";
+            std::cout << "Target might be in stack, heap, or filtered regions.\n";
+            std::cout << "Try searching for pointers to nearby addresses or use a different target.\n";
+        }
+        
         std::vector<DWORD_PTR> level0Pointers;
         auto it = pointerMap.find(targetAddr);
         if (it != pointerMap.end()) {
             level0Pointers = it->second;
         }
         
-        std::cout << "Found " << level0Pointers.size() << " direct pointers to target.\n\n";
+        std::cout << "Found " << level0Pointers.size() << " direct pointers to target.\n";
         
+        // Show some debugging info about nearby addresses
         if (level0Pointers.empty()) {
-            std::cout << "No direct pointers found. Target might be in stack/heap.\n";
+            std::cout << "\nDEBUG: Checking nearby addresses for pointers...\n";
+            CheckNearbyAddresses(targetAddr, pointerMap);
+            
+            std::cout << "\nNo direct pointers found. This could mean:\n";
+            std::cout << "1. Target is in stack/heap memory (not scanned)\n";
+            std::cout << "2. Target address has changed since you found it\n";
+            std::cout << "3. Target is pointed to by calculated addresses (not static pointers)\n";
+            std::cout << "4. Target is in a memory region we filtered out\n";
+            std::cout << "\nTry: Find the value again and immediately search for pointers.\n";
             return;
         }
+        
+        std::cout << std::endl;
         
         // Step 3: Recursively build pointer chains
         std::cout << "Step 3: Building pointer chains...\n";
@@ -1314,6 +1342,102 @@ public:
         }
         
         return pointersFound;
+    }
+    
+    // Validate that target address is still readable and contains expected data
+    bool ValidateTargetAddress(DWORD_PTR targetAddr) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQueryEx(processHandle, (LPCVOID)targetAddr, &mbi, sizeof(mbi)) == 0) {
+            std::cout << "  Target address is not mapped in memory.\n";
+            return false;
+        }
+        
+        if (mbi.State != MEM_COMMIT) {
+            std::cout << "  Target address is not committed memory.\n";
+            return false;
+        }
+        
+        if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) {
+            std::cout << "  Target address is not accessible.\n";
+            return false;
+        }
+        
+        // Try to read a small amount of data from the target
+        BYTE testData[4];
+        SIZE_T bytesRead;
+        if (!ReadProcessMemory(processHandle, (LPCVOID)targetAddr, testData, 4, &bytesRead)) {
+            std::cout << "  Cannot read from target address.\n";
+            return false;
+        }
+        
+        std::cout << "  Target contains: 0x" << std::hex;
+        for (int i = 0; i < 4; i++) {
+            std::cout << std::setw(2) << std::setfill('0') << (int)testData[i];
+        }
+        std::cout << std::dec << std::endl;
+        
+        return true;
+    }
+    
+    // Check if address is in our scanned regions
+    bool IsAddressInScannedRegions(DWORD_PTR targetAddr) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQueryEx(processHandle, (LPCVOID)targetAddr, &mbi, sizeof(mbi)) == 0) {
+            return false;
+        }
+        
+        // Check if this region type would have been scanned
+        bool isScannable = (mbi.State == MEM_COMMIT && 
+                           (mbi.Protect & PAGE_GUARD) == 0 && 
+                           (mbi.Protect & PAGE_NOACCESS) == 0);
+        
+        bool isPointerRegion = (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) ||
+                              (mbi.Type == MEM_PRIVATE) || // Heap allocations
+                              (mbi.Type == MEM_IMAGE);     // Module sections
+        
+        bool isReasonableSize = mbi.RegionSize >= 4096;
+        
+        if (!isScannable) {
+            std::cout << "  Target is in non-scannable memory (protected/guard pages).\n";
+            return false;
+        }
+        
+        if (!isPointerRegion) {
+            std::cout << "  Target is in filtered memory type (Type: " << mbi.Type 
+                     << ", Protect: 0x" << std::hex << mbi.Protect << std::dec << ").\n";
+            return false;
+        }
+        
+        if (!isReasonableSize) {
+            std::cout << "  Target is in small memory region (" << mbi.RegionSize << " bytes).\n";
+            return false;
+        }
+        
+        return true;
+    }
+    
+    // Check nearby addresses for debugging
+    void CheckNearbyAddresses(DWORD_PTR targetAddr, const std::map<DWORD_PTR, std::vector<DWORD_PTR>>& pointerMap) {
+        std::cout << "Checking addresses near target:\n";
+        
+        int foundNearby = 0;
+        for (int offset = -64; offset <= 64; offset += 4) {
+            if (offset == 0) continue; // Skip the target itself
+            
+            DWORD_PTR checkAddr = targetAddr + offset;
+            auto it = pointerMap.find(checkAddr);
+            if (it != pointerMap.end() && !it->second.empty()) {
+                std::cout << "  0x" << std::hex << checkAddr << std::dec 
+                         << " (target" << std::showpos << offset << std::noshowpos 
+                         << ") has " << it->second.size() << " pointers\n";
+                foundNearby++;
+                if (foundNearby >= 5) break; // Limit output
+            }
+        }
+        
+        if (foundNearby == 0) {
+            std::cout << "  No pointers found to nearby addresses either.\n";
+        }
     }
     
     // Fast pointer validation without expensive system calls
